@@ -22,7 +22,7 @@ macro_rules! test_schema {
                 let mut f = mint.new_goldenfile(stringify!($name))?;
 
                 write!(f, "Query: {}\n", $query.trim())?;
-                match engine.session()?.execute($query) {
+                match engine.session().execute($query) {
                     Ok(result) => write!(f, "Result: {:?}\n\n", result)?,
                     Err(err) => write!(f, "Error: {:?}\n\n", err)?,
                 };
@@ -149,6 +149,8 @@ test_schema! { with [
     drop_table_bare: "DROP TABLE",
     drop_table_missing: "DROP TABLE name",
     drop_table_multiple: "DROP TABLE a, c",
+    drop_table_if_exists: "DROP TABLE IF EXISTS a",
+    drop_table_if_exists_missing: "DROP TABLE IF EXISTS name",
 }
 test_schema! { with [
         "CREATE TABLE target (id INTEGER PRIMARY KEY)",

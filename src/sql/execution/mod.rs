@@ -5,7 +5,7 @@ mod query;
 mod schema;
 mod source;
 
-pub use aggregation::Aggregation;
+use aggregation::Aggregation;
 use join::{HashJoin, NestedLoopJoin};
 use mutation::{Delete, Insert, Update};
 use query::{Filter, Limit, Offset, Order, Projection};
@@ -35,7 +35,7 @@ impl<T: Transaction + 'static> dyn Executor<T> {
             }
             Node::CreateTable { schema } => CreateTable::new(schema),
             Node::Delete { table, source } => Delete::new(table, Self::build(*source)),
-            Node::DropTable { table } => DropTable::new(table),
+            Node::DropTable { table, if_exists } => DropTable::new(table, if_exists),
             Node::Filter { source, predicate } => Filter::new(Self::build(*source), predicate),
             Node::HashJoin { left, left_field, right, right_field, outer } => HashJoin::new(
                 Self::build(*left),
@@ -107,6 +107,7 @@ pub enum ResultSet {
     // Table dropped
     DropTable {
         name: String,
+        existed: bool,
     },
     // Query result
     Query {
@@ -128,8 +129,14 @@ impl ResultSet {
 
     /// Converts the ResultSet into a row, or errors if not a query result with rows.
     pub fn into_row(self) -> Result<Row> {
-        if let ResultSet::Query { mut rows, .. } = self {
-            rows.next().transpose()?.ok_or_else(|| Error::Value("No rows returned".into()))
+        self.into_rows()?.next().transpose()?.ok_or_else(|| Error::Value("No rows returned".into()))
+    }
+
+    /// Converts the ResultSet into a row iterator, or errors if not a query
+    /// result with rows.
+    pub fn into_rows(self) -> Result<Rows> {
+        if let ResultSet::Query { rows, .. } = self {
+            Ok(rows)
         } else {
             Err(Error::Value(format!("Not a query result: {:?}", self)))
         }

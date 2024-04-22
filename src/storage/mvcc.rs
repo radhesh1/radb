@@ -25,7 +25,7 @@
 //! A transaction t2 that started at T=2 will see the values a=a1, c=c1, d=d1. A
 //! different transaction t5 running at T=5 will see a=a4, b=b3, c=c1.
 //!
-//! ToyDB uses logical timestamps with a sequence number stored in
+//! RaDB uses logical timestamps with a sequence number stored in
 //! Key::NextVersion. Each new read-write transaction takes its timestamp from
 //! the current value of Key::NextVersion and then increments the value for the
 //! next transaction.
@@ -135,11 +135,12 @@
 //!
 //! Normally, old versions would be garbage collected regularly, when they are
 //! no longer needed by active transactions or time-travel queries. However,
-//! ToyDB does not implement garbage collection, instead keeping all history
+//! RaDB does not implement garbage collection, instead keeping all history
 //! forever, both out of laziness and also because it allows unlimited time
 //! travel queries (it's a feature, not a bug!).
 
-use super::{bincode, engine::Engine, keycode};
+use super::engine::Engine;
+use crate::encoding::{bincode, keycode};
 use crate::error::{Error, Result};
 
 use serde::{Deserialize, Serialize};
@@ -349,7 +350,7 @@ impl TransactionState {
     /// that version commits its writes. See the module documentation for
     /// details.
     fn is_visible(&self, version: Version) -> bool {
-        if self.active.get(&version).is_some() {
+        if self.active.contains(&version) {
             false
         } else if self.read_only {
             version < self.version
@@ -786,7 +787,7 @@ impl<'a, E: Engine> DoubleEndedIterator for VersionIterator<'a, E> {
 #[cfg(test)]
 pub mod tests {
     use super::super::debug;
-    use super::super::engine::{Debug, Memory};
+    use super::super::{Debug, Memory};
     use super::*;
     use std::collections::HashMap;
     use std::io::Write as _;
@@ -1820,7 +1821,7 @@ pub mod tests {
         t2.set(b"a", vec![2])?;
         t2.set(b"b", vec![2])?;
         t2.commit()?;
-        assert_eq!(t1.get(b"a")?, Some(vec![0]));
+        assert_eq!(t1.get(b"b")?, Some(vec![0]));
 
         Ok(())
     }

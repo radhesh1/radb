@@ -1,4 +1,4 @@
-use super::super::{Address, Event, Message};
+use super::super::{Envelope, Message};
 use super::{rand_election_timeout, Follower, Leader, Node, NodeID, RawNode, Role, Term, Ticks};
 use crate::error::{Error, Result};
 
@@ -88,12 +88,12 @@ impl RawNode<Candidate> {
     }
 
     /// Processes a message.
-    pub fn step(mut self, msg: Message) -> Result<Node> {
+    pub fn step(mut self, msg: Envelope) -> Result<Node> {
         self.assert()?;
         self.assert_step(&msg);
 
         // Drop messages from past terms.
-        if msg.term < self.term && msg.term > 0 {
+        if msg.term < self.term {
             debug!("Dropping message from past term ({:?})", msg);
             return Ok(self.into());
         }
@@ -105,36 +105,38 @@ impl RawNode<Candidate> {
             return self.into_follower(msg.term, None)?.step(msg);
         }
 
-        match msg.event {
+        match msg.message {
             // Ignore other candidates when we're also campaigning.
-            Event::SolicitVote { .. } => {}
+            Message::Campaign { .. } => {}
 
-            // We received a vote. Record it, and if we have quorum, assume
-            // leadership.
-            Event::GrantVote => {
-                self.role.votes.insert(msg.from.unwrap());
+            // If we received a vote, record it. If the vote gives us quorum,
+            // assume leadership.
+            Message::CampaignResponse { vote: true } => {
+                self.role.votes.insert(msg.from);
                 if self.role.votes.len() as u8 >= self.quorum_size() {
                     return Ok(self.into_leader()?.into());
                 }
             }
 
+            // We didn't get a vote. :(
+            Message::CampaignResponse { vote: false } => {}
+
             // If we receive a heartbeat or entries in this term, we lost the
             // election and have a new leader. Follow it and step the message.
-            Event::Heartbeat { .. } | Event::AppendEntries { .. } => {
-                return self.into_follower(msg.term, Some(msg.from.unwrap()))?.step(msg);
+            Message::Heartbeat { .. } | Message::Append { .. } => {
+                return self.into_follower(msg.term, Some(msg.from))?.step(msg);
             }
 
             // Abort any inbound client requests while candidate.
-            Event::ClientRequest { id, .. } => {
-                self.send(msg.from, Event::ClientResponse { id, response: Err(Error::Abort) })?;
+            Message::ClientRequest { id, .. } => {
+                self.send(msg.from, Message::ClientResponse { id, response: Err(Error::Abort) })?;
             }
 
             // We're not a leader in this term, nor are we forwarding requests,
             // so we shouldn't see these.
-            Event::ConfirmLeader { .. }
-            | Event::AcceptEntries { .. }
-            | Event::RejectEntries { .. }
-            | Event::ClientResponse { .. } => panic!("Received unexpected message {:?}", msg),
+            Message::HeartbeatResponse { .. }
+            | Message::AppendResponse { .. }
+            | Message::ClientResponse { .. } => panic!("Received unexpected message {:?}", msg),
         }
         Ok(self.into())
     }
@@ -161,28 +163,26 @@ impl RawNode<Candidate> {
         self.log.set_term(term, Some(self.id))?;
 
         let (last_index, last_term) = self.log.get_last_index();
-        self.send(Address::Broadcast, Event::SolicitVote { last_index, last_term })?;
+        self.broadcast(Message::Campaign { last_index, last_term })?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{Entry, Instruction, Log, Request};
+    use super::super::super::state::tests::TestState;
+    use super::super::super::{Entry, Log, Request};
     use super::super::tests::{assert_messages, assert_node};
     use super::*;
     use crate::storage;
-    use tokio::sync::mpsc;
+    use itertools::Itertools as _;
 
     #[allow(clippy::type_complexity)]
-    fn setup() -> Result<(
-        RawNode<Candidate>,
-        mpsc::UnboundedReceiver<Message>,
-        mpsc::UnboundedReceiver<Instruction>,
-    )> {
-        let (node_tx, node_rx) = mpsc::unbounded_channel();
-        let (state_tx, state_rx) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false)?;
+    fn setup() -> Result<(RawNode<Candidate>, crossbeam::channel::Receiver<Envelope>)> {
+        let (node_tx, node_rx) = crossbeam::channel::unbounded();
+        let state = Box::new(TestState::new(0));
+        let mut log = Log::new(storage::Memory::new(), false)?;
+
         log.append(1, Some(vec![0x01]))?;
         log.append(1, Some(vec![0x02]))?;
         log.append(2, Some(vec![0x03]))?;
@@ -194,123 +194,120 @@ mod tests {
             peers: HashSet::from([2, 3, 4, 5]),
             term: 3,
             log,
+            state,
             node_tx,
-            state_tx,
             role: Candidate::new(),
         };
         node.role.votes.insert(1);
-        Ok((node, node_rx, state_rx))
+        Ok((node, node_rx))
     }
 
     #[test]
     // Heartbeat for current term converts to follower and emits ConfirmLeader.
     fn step_heartbeat_current_term() -> Result<()> {
-        let (candidate, mut node_rx, mut state_rx) = setup()?;
-        let mut node = candidate.step(Message {
-            from: Address::Node(2),
-            to: Address::Node(1),
+        let (candidate, mut node_rx) = setup()?;
+        let mut node = candidate.step(Envelope {
+            from: 2,
+            to: 1,
             term: 3,
-            event: Event::Heartbeat { commit_index: 2, commit_term: 1 },
+            message: Message::Heartbeat { commit_index: 2, commit_term: 1, read_seq: 7 },
         })?;
         assert_node(&mut node).is_follower().term(3);
         assert_messages(
             &mut node_rx,
-            vec![Message {
-                from: Address::Node(1),
-                to: Address::Node(2),
+            vec![Envelope {
+                from: 1,
+                to: 2,
                 term: 3,
-                event: Event::ConfirmLeader { commit_index: 2, has_committed: true },
+                message: Message::HeartbeatResponse { last_index: 3, last_term: 2, read_seq: 7 },
             }],
         );
-        assert_messages(&mut state_rx, vec![]);
         Ok(())
     }
 
     #[test]
-    // Heartbeat for future term converts to follower and emits ConfirmLeader
-    // event.
+    // Heartbeat for future term converts to follower and emits ConfirmLeader.
     fn step_heartbeat_future_term() -> Result<()> {
-        let (candidate, mut node_rx, mut state_rx) = setup()?;
-        let mut node = candidate.step(Message {
-            from: Address::Node(2),
-            to: Address::Node(1),
+        let (candidate, mut node_rx) = setup()?;
+        let mut node = candidate.step(Envelope {
+            from: 2,
+            to: 1,
             term: 4,
-            event: Event::Heartbeat { commit_index: 2, commit_term: 1 },
+            message: Message::Heartbeat { commit_index: 2, commit_term: 1, read_seq: 7 },
         })?;
         assert_node(&mut node).is_follower().term(4);
         assert_messages(
             &mut node_rx,
-            vec![Message {
-                from: Address::Node(1),
-                to: Address::Node(2),
+            vec![Envelope {
+                from: 1,
+                to: 2,
                 term: 4,
-                event: Event::ConfirmLeader { commit_index: 2, has_committed: true },
+                message: Message::HeartbeatResponse { last_index: 3, last_term: 2, read_seq: 7 },
             }],
         );
-        assert_messages(&mut state_rx, vec![]);
         Ok(())
     }
 
     #[test]
     // Heartbeat for past term is ignored
     fn step_heartbeat_past_term() -> Result<()> {
-        let (candidate, mut node_rx, mut state_rx) = setup()?;
-        let mut node = candidate.step(Message {
-            from: Address::Node(2),
-            to: Address::Node(1),
+        let (candidate, mut node_rx) = setup()?;
+        let mut node = candidate.step(Envelope {
+            from: 2,
+            to: 1,
             term: 2,
-            event: Event::Heartbeat { commit_index: 1, commit_term: 1 },
+            message: Message::Heartbeat { commit_index: 1, commit_term: 1, read_seq: 7 },
         })?;
         assert_node(&mut node).is_candidate().term(3);
         assert_messages(&mut node_rx, vec![]);
-        assert_messages(&mut state_rx, vec![]);
         Ok(())
     }
 
     #[test]
     fn step_grantvote() -> Result<()> {
-        let (candidate, mut node_rx, mut state_rx) = setup()?;
+        let (candidate, mut node_rx) = setup()?;
         let peers = candidate.peers.clone();
         let mut node = Node::Candidate(candidate);
 
         // The first vote is not sufficient for a quorum (3 votes including self)
-        node = node.step(Message {
-            from: Address::Node(3),
-            to: Address::Node(1),
+        node = node.step(Envelope {
+            from: 3,
+            to: 1,
             term: 3,
-            event: Event::GrantVote,
+            message: Message::CampaignResponse { vote: true },
         })?;
         assert_node(&mut node).is_candidate().term(3);
         assert_messages(&mut node_rx, vec![]);
-        assert_messages(&mut state_rx, vec![]);
 
         // However, the second external vote makes us leader
-        node = node.step(Message {
-            from: Address::Node(5),
-            to: Address::Node(1),
+        node = node.step(Envelope {
+            from: 5,
+            to: 1,
             term: 3,
-            event: Event::GrantVote,
+            message: Message::CampaignResponse { vote: true },
         })?;
         assert_node(&mut node).is_leader().term(3);
 
-        assert_eq!(
-            node_rx.try_recv()?,
-            Message {
-                from: Address::Node(1),
-                to: Address::Broadcast,
-                term: 3,
-                event: Event::Heartbeat { commit_index: 2, commit_term: 1 },
-            },
-        );
-
-        for to in peers.iter().cloned() {
+        for to in peers.iter().copied().sorted() {
             assert_eq!(
                 node_rx.try_recv()?,
-                Message {
-                    from: Address::Node(1),
-                    to: Address::Node(to),
+                Envelope {
+                    from: 1,
+                    to,
                     term: 3,
-                    event: Event::AppendEntries {
+                    message: Message::Heartbeat { commit_index: 2, commit_term: 1, read_seq: 0 },
+                },
+            );
+        }
+
+        for to in peers.iter().copied() {
+            assert_eq!(
+                node_rx.try_recv()?,
+                Envelope {
+                    from: 1,
+                    to,
+                    term: 3,
+                    message: Message::Append {
                         base_index: 3,
                         base_term: 2,
                         entries: vec![Entry { index: 4, term: 3, command: None }],
@@ -320,39 +317,38 @@ mod tests {
         }
 
         assert_messages(&mut node_rx, vec![]);
-        assert_messages(&mut state_rx, vec![]);
         Ok(())
     }
 
     #[test]
     // ClientRequest returns Error::Abort.
     fn step_clientrequest() -> Result<()> {
-        let (candidate, mut node_rx, mut state_rx) = setup()?;
+        let (candidate, mut node_rx) = setup()?;
         let mut node = Node::Candidate(candidate);
 
-        node = node.step(Message {
-            from: Address::Client,
-            to: Address::Node(1),
-            term: 0,
-            event: Event::ClientRequest { id: vec![0x01], request: Request::Mutate(vec![0xaf]) },
+        node = node.step(Envelope {
+            from: 1,
+            to: 1,
+            term: 3,
+            message: Message::ClientRequest { id: vec![0x01], request: Request::Write(vec![0xaf]) },
         })?;
         assert_node(&mut node).is_candidate().term(3);
         assert_messages(
             &mut node_rx,
-            vec![Message {
-                from: Address::Node(1),
-                to: Address::Client,
+            vec![Envelope {
+                from: 1,
+                to: 1,
                 term: 3,
-                event: Event::ClientResponse { id: vec![0x01], response: Err(Error::Abort) },
+                message: Message::ClientResponse { id: vec![0x01], response: Err(Error::Abort) },
             }],
         );
-        assert_messages(&mut state_rx, vec![]);
         Ok(())
     }
 
     #[test]
     fn tick() -> Result<()> {
-        let (candidate, mut node_rx, mut state_rx) = setup()?;
+        let (candidate, node_rx) = setup()?;
+        let peers = candidate.peers.clone();
         let timeout = candidate.role.election_timeout;
         let mut node = Node::Candidate(candidate);
 
@@ -363,16 +359,17 @@ mod tests {
         }
         assert_node(&mut node).is_candidate().term(4);
 
-        assert_messages(
-            &mut node_rx,
-            vec![Message {
-                from: Address::Node(1),
-                to: Address::Broadcast,
-                term: 4,
-                event: Event::SolicitVote { last_index: 3, last_term: 2 },
-            }],
-        );
-        assert_messages(&mut state_rx, vec![]);
+        for to in peers.iter().copied().sorted() {
+            assert_eq!(
+                node_rx.try_recv()?,
+                Envelope {
+                    from: 1,
+                    to,
+                    term: 4,
+                    message: Message::Campaign { last_index: 3, last_term: 2 },
+                },
+            );
+        }
         Ok(())
     }
 }

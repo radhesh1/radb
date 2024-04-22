@@ -49,9 +49,9 @@ clients and other nodes. The following diagram illustrates its internal structur
 
 ![raDB architecture](./images/architecture.svg)
 
-At the bottom is a simple [key/value store](https://en.wikipedia.org/wiki/Key–value_database), 
+At the bottom is a simple [key/value store](https://en.wikipedia.org/wiki/Key–value_database),
 which stores all SQL data. This is wrapped inside an
-[MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control) key/value store that adds 
+[MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control) key/value store that adds
 [ACID transactions](https://en.wikipedia.org/wiki/ACID). On top of that is a SQL storage engine,
 providing basic [CRUD operations](https://en.wikipedia.org/wiki/Create,_read,_update_and_delete)
 on tables, rows, and indexes. This makes up the node's core storage engine.
@@ -59,7 +59,7 @@ on tables, rows, and indexes. This makes up the node's core storage engine.
 The SQL storage engine is wrapped in a Raft state machine interface, allowing it to be managed
 by the Raft consensus engine. The Raft node receives commands from clients and coordinates with
 other Raft nodes to reach consensus on an ordered command log. Once commands are committed to
-the log, they are sent to the state machine driver which applies them to the local state machine.
+the log, they are applied to the local state machine.
 
 On top of the Raft engine is a Raft-based SQL storage engine, which implements the SQL storage
 interface and submits commands to the Raft cluster. This allows the rest of the SQL layer to use
@@ -72,18 +72,15 @@ handles configuration, logging, and other process-level concerns.
 
 ## Storage Engine
 
-The storage engine is actually two different storage engines: key/value storage used by the SQL
-engine, and log-structured storage used by the Raft node. These are both pluggable via the
-`storage_sql` and `storage_raft` configuration options, and have multiple implementations with
-different characteristics.
-
-The SQL storage engine will be discussed separately in the [SQL section](#sql-engine).
+raDB uses a pluggable key/value storage engine, with the SQL and Raft storage engines configurable
+via the `storage_sql` and `storage_raft` options respectively. The higher-level SQL storage engine
+will be discussed separately in the [SQL section](#sql-engine).
 
 ### Key/Value Storage
 
 A key/value storage engine stores arbitrary key/value pairs as binary byte slices, and implements
 the
-[`storage::Engine`](../src/storage/engine/mod.rs) 
+[`storage::Engine`](https://github.com/radhesh1/radb/blob/master/src/storage/engine.rs)
 trait:
 
 ```rust
@@ -128,7 +125,7 @@ SQL table scans) and has a couple of important implications:
 * Keys should use an order-preserving byte encoding, to allow range scans.
 
 The engine itself does not care what keys contain, but the storage module offers
-an order-preserving key encoding called [KeyCode](../src/storage/keycode.rs)
+an order-preserving key encoding called [KeyCode](https://github.com/radhesh1/radb/blob/master/src/encoding/keycode.rs)
 for use by higher layers. These storage layers often use composite keys made up
 of several possibly variable-length values (e.g. an index key consists of table,
 column, and value), and the natural ordering of each segment must be preserved,
@@ -150,7 +147,7 @@ Additionally, several container types are supported:
 * Value: like enum.
 
 The default key/value engine is
-[`storage::engine::BitCask`](../src/storage/engine/bitcask.rs),
+[`storage::BitCask`](https://github.com/radhesh1/radb/blob/master/src/storage/bitcask.rs),
 a very simple variant of Bitcask, an append-only log-structured storage engine.
 All writes are appended to a log file, with an index mapping live keys to file
 positions maintained in memory.  When the amount of garbage (replaced or deleted
@@ -174,11 +171,11 @@ simplicity and correctness.
 [MVCC (Multi-Version Concurrency Control)](https://en.wikipedia.org/wiki/Multiversion_concurrency_control)
 is a relatively simple concurrency control mechanism that provides
 [ACID transactions](https://en.wikipedia.org/wiki/ACID) with
-[snapshot isolation](https://en.wikipedia.org/wiki/Snapshot_isolation) without taking out locks or 
+[snapshot isolation](https://en.wikipedia.org/wiki/Snapshot_isolation) without taking out locks or
 having writes block reads. It also versions all data, allowing querying of historical data.
 
 raDB implements MVCC at the storage layer as
-[`storage::mvcc::MVCC`](../src/storage/mvcc.rs),
+[`storage::mvcc::MVCC`](https://github.com/radhesh1/radb/blob/master/src/storage/mvcc.rs),
 using any `storage::Engine` implementation for underlying storage. `begin` returns a new
 transaction, which provides the usual key/value operations such as `get`, `set`, and `scan`.
 Additionally, it has a `commit` method which persists the changes and makes them visible to
@@ -190,10 +187,10 @@ takes a snapshot of the active set, containing the versions of all other active 
 the transaction start, and saves it as `Key::TxnActiveSnapshot(id)`.
 
 Key/value pairs are saved as `Key::Version(key, version)`, where `key` is the user-provided key
-and `version` is the transaction's version. The visibility of key/value pairs for a transaction is 
+and `version` is the transaction's version. The visibility of key/value pairs for a transaction is
 given as follows:
 
-* For a given user key, do a reverse scan of `Key::Version(key, version)` starting at the current 
+* For a given user key, do a reverse scan of `Key::Version(key, version)` starting at the current
   transaction's version.
 
 * Skip any records whose version is in the transaction's snapshot of the active set.
@@ -226,80 +223,11 @@ entry of a past transaction and applies the same visibility rules as for normal 
 require [serializable snapshot isolation](https://courses.cs.washington.edu/courses/cse444/08au/544M/READING-LIST/fekete-sigmod2008.pdf),
 which was considered unnecessary for a first version - it may be implemented later.
 
-**Garbage collection:** old MVCC versions are never removed, leading to unbounded disk usage. 
+**Garbage collection:** old MVCC versions are never removed, leading to unbounded disk usage.
 However, this also allows for complete data history, and simplifies the implementation.
 
 **Transaction ID overflow:** transaction IDs will overflow after 64 bits, but this is never going to
 happen with raDB.
-
-### Log-structured Storage
-
-The Raft node needs to keep a log of state machine commands encoded as arbitrary byte slices.
-This log is mostly append-only, and storing it in a random-access key/value store would be
-slower and more complex than using a log-structured store purpose-built for this access pattern.
-
-Log stores implement the [`storage::log::Store`](../src/storage/log/mod.rs)
-trait, a subset of which includes:
-
-```rust
-pub trait Store: Display + Sync + Send {
-    /// Appends a log entry, returning its index.
-    fn append(&mut self, entry: Vec<u8>) -> Result<u64>;
-
-    /// Commits log entries up to and including the given index, making them immutable.
-    fn commit(&mut self, index: u64) -> Result<()>;
-
-    /// Fetches a log entry, if it exists.
-    fn get(&self, index: u64) -> Result<Option<Vec<u8>>>;
-
-    /// Iterates over an ordered range of log entries.
-    fn scan(&self, range: Range) -> Scan;
-
-    /// Truncates the log by removing any entries above the given index, and returns the
-    /// highest remaining index. Attempting to truncate a committed entry will error.
-    fn truncate(&mut self, index: u64) -> Result<u64>;
-}
-```
-
-The Raft node appends all received commands to its local log, but only commits entries once they
-are confirmed by consensus. The local log may need to be truncated, e.g. in the case of a leader
-change, removing a number of uncommitted entries.
-
-Additionally, the store must be able to store a handful of arbitrary key/value metadata pairs
-for the Raft node, via `set_metadata(key, value)` and `get_metadata(key)` methods.
-
-The default log store in raDB is
-[`storage::log::Hybrid`](../src/storage/log/hybrid.rs),
-which stores uncommitted entries in memory and committed entries on disk. This allows the log to
-be written append-only and in order, giving very good performance both for writes and bulk
-reads. The number of uncommitted entries is also generally small since consensus is generally
-fast.
-
-New log entries are kept in a `VecDeque` (double-ended queue) until they are committed. On
-commit, entries are appended to the file with a `u32` length prefix, and the file is fsynced (if
-enabled). Entry positions are kept in an in-memory `HashMap` keyed by entry index, for
-retrieval, and this map is rebuilt on startup by scanning the log file.
-
-Metadata key/value pairs are kept in an in-memory `HashMap` and the entire hashmap is written to
-a separate file on every write.
-
-#### Log Tradeoffs
-
-**Startup log scan:** scanning the entire file on startup to build the entry index can be
-time-consuming, and the index requires a bit of memory. However, this avoids having to maintain
-separate index storage, which could be expensive to fsync, and data sets are expected to be small.
-
-**Metadata storage:** metadata key/value pairs should be stored in e.g. an on-disk B-tree
-key/value store, but raDB current does not have such a store. However, the number of metadata items
-is very small - specifically 1: the current Raft term/vote tuple.
-
-**Memory buffering:** buffering uncommitted entries in memory may require a lot of memory if
-consensus halts, e.g. due to loss of quorum. However, for raDB use-cases this is not a major
-problem, and it avoid having to do additional (possibly random) disk IO, greatly improving
-performance.
-
-**Garbage collection:** there is no garbage collection of old log entries, so the log will grow
-without bound.
 
 ## Raft Consensus Engine
 
@@ -307,41 +235,30 @@ The Raft consensus protocol is explained well in the
 [original Raft paper](https://raft.github.io/raft.pdf), and will not be repeated here - refer to
 it for details. raDB's implementation follows the paper fairly closely.
 
-The Raft node [`raft::Node`](https://github.com/erikgrinaker/raDB/tree/master/src/raft/node) is
+The Raft node [`raft::Node`](https://github.com/radhesh1/radb/tree/master/src/raft/node) is
 the core of the implementation, a finite state machine with enum variants for the node roles:
 leader, follower, and candidate. This enum wraps the `RoleNode` struct, which contains common
 node functionality and is generic over the specific roles `Leader`, `Follower`, and `Candidate`
 that implement the Raft protocol.
 
 Nodes are initialized with an ID and a list of peer IDs, and communicate by passing
-[`raft::Message`](../src/raft/message.rs)
+[`raft::Message`](https://github.com/radhesh1/radb/blob/master/src/raft/message.rs)
 messages. Inbound messages are received via `Node.step()` calls, and outbound messages are sent
 via an `mpsc` channel. Nodes also use a logical clock to keep track of e.g. election timeouts
 and heartbeats, and the clock is ticked at regular intervals via `Node.tick()` calls. These
 methods are synchronous and may cause state transitions, e.g. changing a candidate into a leader
 when it receives the winning vote.
 
-Nodes have a command log [`raft::Log`](../src/raft/log.rs),
-using a `storage::Engine` for storage. Leaders receive client commands via request messages,
-replicate them to peers, and commit the commands to the log subject to consensus. Once a command is
-committed, is it applied to the state machine asynchronously.
-
-The Raft-managed state machine (i.e. the SQL storage engine) implements the
-[`raft::State`](../src/raft/state.rs) trait and
-is given to the node on initialization. The state machine driver
-[`raft::Driver`](../src/raft/state.rs) has
-ownership of the state machine, and runs in a separate thread (or rather, a
-[Tokio](https://tokio.rs) task) receiving instructions via an `mpsc` channel - this avoids
-long-running commands blocking the main Raft node from responding to messages.
-
-In addition to applying state machine commands, the driver also responds to client requests via
-an outbound `mpsc` channel. When the leader receives a state _mutation_ request from a client,
-it not only appends the command to its log, but it also tells the driver that the client is to
-be notified with the result once the command is applied. When the leader receives a state
-_query_ request, the state driver is notified about the query before the leader asks all peers
-to confirm that it is still the leader (required to satisfy linearizability). The confirmations
-are passed to the state machine driver, and once a majority vote is received the query is
-executed against the state machine and the result returned to the client.
+Nodes have a command log [`raft::Log`](https://github.com/radhesh1/radb/blob/master/src/raft/log.rs),
+using a `storage::Engine` for storage, and a [`raft::State`](https://github.com/radhesh1/radb/blob/master/src/raft/state.rs)
+state machine (the SQL engine). When the leader receives a write request, it appends the command
+to its local log and replicates it to followers. Once a quorum have replicated it, the command is
+committed and applied to the state machine, and the result returned the client. When the leader
+receives a read request, it needs to ensure it is still the leader in order to satisfy
+linearizability (a new leader could exist elsewhere resulting in a stale read). It increments a
+read sequence number and broadcasts it via a Raft heartbeat. Once a quorum have confirmed the
+leader at this sequence number, the read command is executed against the state machine and the
+result returned to the client.
 
 The actual network communication is handled by the server process, which will be described in a
 [separate section](#server).
@@ -351,6 +268,10 @@ The actual network communication is handled by the server process, which will be
 **Single-threaded state:** all state operations run in a single thread on the leader, preventing
 horizontal scalability. Improvements here would require running multiple sharded Raft clusters,
 which is out of scope for the project.
+
+**Synchronous application:** state machine application happens synchronously in the main Raft
+thread. This is significantly simpler than asynchronous application, but may cause delays in
+Raft processing.
 
 **Log replication:** only the simplest form of Raft log replication is implemented, without
 state snapshots or rapid log replay. Lagging nodes will be very slow to catch up.
@@ -373,19 +294,19 @@ storage engine, completing the chain.
 ### Types
 
 raDB has a very simple type system, with the
-[`sql::DataType`](../src/sql/types/mod.rs) enum 
+[`sql::DataType`](https://github.com/radhesh1/radb/blob/master/src/sql/types/mod.rs) enum
 specifying the available data types: `Boolean`, `Integer`, `Float`, and `String`.
 
-The [`sql::Value`](../src/sql/types/mod.rs) enum 
-represents a specific value using Rust's native type system, e.g. an integer value is 
-`Value::Integer(i64)`. This enum also specifies comparison, ordering, and formatting of values. The 
+The [`sql::Value`](https://github.com/radhesh1/radb/blob/master/src/sql/types/mod.rs) enum
+represents a specific value using Rust's native type system, e.g. an integer value is
+`Value::Integer(i64)`. This enum also specifies comparison, ordering, and formatting of values. The
 special value `Value::Null` represents an unknown value of unknown type, following the rules of
 [three-valued logic](https://en.wikipedia.org/wiki/Three-valued_logic).
 
 Values can be grouped into a `Row`, which is an alias for `Vec<Value>`. The type `Rows` is an alias
 for a fallible row iterator, and `Column` is a result column containing a name.
 
-Expressions [`sql::Expression`](../src/sql/types/expression.rs)
+Expressions [`sql::Expression`](https://github.com/radhesh1/radb/blob/master/src/sql/types/expression.rs)
 represent operations on values. For example, `(1 + 2) * 3` is represented as:
 
 ```rust
@@ -402,14 +323,14 @@ Calling `evaluate()` on the expression will recursively evaluate it, returning `
 
 ### Schemas
 
-The schema defines the tables [`sql::Table`](../src/sql/schema.rs)
-and columns [`sql::Column`](../src/sql/schema.rs)
+The schema defines the tables [`sql::Table`](https://github.com/radhesh1/radb/blob/master/src/sql/schema.rs)
+and columns [`sql::Column`](https://github.com/radhesh1/radb/blob/master/src/sql/schema.rs)
 in a raDB database. Tables have a name and a list of columns, while a column has several
 attributes such as name, data type, and various constraints. They also have methods to
 validate rows and values, e.g. to make sure a value is of the correct type for a column
 or to enforce referential integrity.
 
-The schema is stored and managed with [`sql::Catalog`](../src/sql/schema.rs),
+The schema is stored and managed with [`sql::Catalog`](https://github.com/radhesh1/radb/blob/master/src/sql/schema.rs),
 a trait implemented by the SQL storage engine:
 
 ```rust
@@ -434,12 +355,12 @@ pub trait Catalog {
 sufficient for raDB's use-cases, and simplifies the implementation.
 
 **Schema changes:** schema changes other than creating or dropping tables is not supported. This
-avoids complicated data migration logic, and allows using table/column names as storage identifiers 
+avoids complicated data migration logic, and allows using table/column names as storage identifiers
 (since they can never change) without any additional indirection.
 
 ### Storage
 
-The SQL storage engine trait is [`sql::Engine`](../src/sql/engine/mod.rs):
+The SQL storage engine trait is [`sql::Engine`](https://github.com/radhesh1/radb/blob/master/src/sql/engine/mod.rs):
 
 ```rust
 pub trait Engine: Clone {
@@ -489,47 +410,48 @@ pub trait Transaction: Catalog {
 ```
 
 The main SQL storage engine implementation is
-[`sql::engine::KV`](../src/sql/engine/kv.rs), which 
+[`sql::engine::KV`](https://github.com/radhesh1/radb/blob/master/src/sql/engine/kv.rs), which
 is built on top of an MVCC key/value store and its transaction functionality.
 
 The Raft SQL storage engine
-[`sql::engine::Raft`](../src/sql/engine/raft.rs)
-uses a Raft API client `raft::Client` to submit state machine commands specified by the enums 
-`Mutation` and `Query` to the local Raft node. It also provides a Raft state machine 
-`sql::engine::raft::State` which wraps a regular `sql::engine::KV` SQL storage engine and applies 
-state machine commands to it. Since the Raft SQL engine implements the `sql::Engine` trait, it can 
+[`sql::engine::Raft`](https://github.com/radhesh1/radb/blob/master/src/sql/engine/raft.rs)
+uses a Raft API client `raft::Client` to submit state machine commands specified by the enums
+`Mutation` and `Query` to the local Raft node. It also provides a Raft state machine
+`sql::engine::raft::State` which wraps a regular `sql::engine::KV` SQL storage engine and applies
+state machine commands to it. Since the Raft SQL engine implements the `sql::Engine` trait, it can
 be used interchangably with the local storage engine.
 
 #### Storage Tradeoffs
 
 **Raft result streaming:** result streaming is not implemented for Raft commands, so the Raft
 SQL engine must buffer the entire result set in memory and serialize it before returning it to
-the client - particularly expensive for table scans. Implementing streaming in Raft was considered 
+the client - particularly expensive for table scans. Implementing streaming in Raft was considered
 out of scope for the project.
 
 ### Parsing
 
-The SQL session [`sql::Session`](../src/sql/engine/mod.rs)
-takes plain-text SQL queries via `execute()` and returns the result. The first step in this process 
+The SQL session [`sql::Session`](https://github.com/radhesh1/radb/blob/master/src/sql/engine/mod.rs)
+takes plain-text SQL queries via `execute()` and returns the result. The first step in this process
 is to parse the query into an [abstract syntax tree](https://en.wikipedia.org/wiki/Abstract_syntax_tree)
 (AST) which represents the query semantics. This happens as follows:
 
 > SQL → Lexer → Tokens → Parser → AST
 
-#### The lexer [`sql::Lexer`](../src/sql/parser/lexer.rs) 
-It takes a SQL string, splits it into pieces, and classifies them as tokens `sql::Token`. It does not
+The lexer
+[`sql::Lexer`](https://github.com/radhesh1/radb/blob/master/src/sql/parser/lexer.rs) takes
+a SQL string, splits it into pieces, and classifies them as tokens `sql::Token`. It does not
 care about the meaning of the tokens, but removes whitespace and tries to figure out if
 something is a number, string, keyword, and so on. It also does some basic pre-processing, such as
 interpreting string quotes, checking number formatting, and rejecting unknown keywords.
 
-For example, the following input string results in the listed tokens, even though the query is 
+For example, the following input string results in the listed tokens, even though the query is
 invalid:
 
 > `3.14 +UPDATE 'abc'` → `Token::Number("3.14")` `Token::Plus` `Token::Keyword(Keyword::Update)` `Token::String("abc")`
 
-#### The parser [`sql::Parser`](../src/sql/parser/mod.rs)
+The parser [`sql::Parser`](https://github.com/radhesh1/radb/blob/master/src/sql/parser/mod.rs)
 iterates over the tokens generated by the lexer, interprets them, and builds an AST representing
-the semantic query. For example, `SELECT name, 2020 - birthyear AS age FROM people` 
+the semantic query. For example, `SELECT name, 2020 - birthyear AS age FROM people`
 results in the following AST:
 
 ```rust
@@ -563,17 +485,17 @@ Notably, the parser also parses expressions, such as `1 + 2 * 3`. This is non-tr
 precedence rules, i.e. `2 * 3` should be evaluated first, but not if there are parentheses
 around `(1 + 2)`. The raDB parser uses the
 [precedence climbing algorithm](https://eli.thegreenplace.net/2012/08/02/parsing-expressions-by-precedence-climbing)
-for this. Also note that AST expressions are different from SQL engine expressions, and do not map 
-one-to-one. This is clearest in the case of function calls, where the parser does not know (or 
-care) if a given function exists, it just parses a function call as an arbitrary function name and 
+for this. Also note that AST expressions are different from SQL engine expressions, and do not map
+one-to-one. This is clearest in the case of function calls, where the parser does not know (or
+care) if a given function exists, it just parses a function call as an arbitrary function name and
 arguments. The planner will translate this into actual expressions that can be evaluated.
 
 ### Planning
 
-The SQL planner [`sql::Planner`](../src/sql/plan/planner.rs)
+The SQL planner [`sql::Planner`](https://github.com/radhesh1/radb/blob/master/src/sql/plan/planner.rs)
 takes the AST generated by the parser and builds a SQL execution plan
-[`sql::Plan`](../src/sql/plan/mod.rs), which is an 
-abstract representation of the steps necessary to execute the query. For example, the following 
+[`sql::Plan`](https://github.com/radhesh1/radb/blob/master/src/sql/plan/mod.rs), which is an
+abstract representation of the steps necessary to execute the query. For example, the following
 shows a simple query and corresponding execution plan, formatted as `EXPLAIN` output:
 
 ```
@@ -621,11 +543,11 @@ Projection: #0, #1
 
 The planner generates a very naïve execution plan, primarily concerned with producing one that
 is _correct_ but not necessarily _fast_. This means that it will always do full table scans,
-always use [nested loop joins](https://en.wikipedia.org/wiki/Nested_loop_join), and so on. The plan 
+always use [nested loop joins](https://en.wikipedia.org/wiki/Nested_loop_join), and so on. The plan
 is then optimized by a series of optimizers implementing
-[`sql::Optimizer`](../src/sql/plan/optimizer.rs):
+[`sql::Optimizer`](https://github.com/radhesh1/radb/blob/master/src/sql/plan/optimizer.rs):
 
-* `ConstantFolder`: pre-evaluates constant expressions to avoid having to re-evaluate them for each 
+* `ConstantFolder`: pre-evaluates constant expressions to avoid having to re-evaluate them for each
   row.
 
 * `FilterPushdown`: pushes filters deeper into the query to reduce the number of rows evaluated by
@@ -634,7 +556,7 @@ is then optimized by a series of optimizers implementing
 
 * `IndexLookup`: transforms table scans into primary key or index lookups where possible.
 
-* `NoopCleaner`: attempts to remove noop operations, e.g. filter nodes that evaluate to a constant 
+* `NoopCleaner`: attempts to remove noop operations, e.g. filter nodes that evaluate to a constant
   `TRUE` value.
 
 * `JoinType`: transforms nested loop joins into hash joins for equijoins (equality join predicate).
@@ -672,13 +594,13 @@ Order: m.title asc
 
 #### Planning Tradeoffs
 
-**Type checking:** expression type conflicts are only detected at evaluation time, not during 
+**Type checking:** expression type conflicts are only detected at evaluation time, not during
 planning.
 
 ### Execution
 
 Every SQL plan node has a corresponding executor, implementing the
-[`sql::Executor`](../src/sql/execution/mod.rs) trait:
+[`sql::Executor`](https://github.com/radhesh1/radb/blob/master/src/sql/execution/mod.rs) trait:
 
 ```rust
 pub trait Executor<T: Transaction> {
@@ -687,8 +609,8 @@ pub trait Executor<T: Transaction> {
 }
 ```
 
-Executors are given a `sql::Transaction` to access the SQL storage engine, and return a 
-`sql::ResultSet` with the query result. Most often, the result is of type `sql::ResultSet::Query` 
+Executors are given a `sql::Transaction` to access the SQL storage engine, and return a
+`sql::ResultSet` with the query result. Most often, the result is of type `sql::ResultSet::Query`
 containing a list of columns and a row iterator. Most executors contain other executors that
 they use as inputs, for example the `Filter` executor will often have a `Scan` executor as a source:
 
@@ -711,25 +633,25 @@ Finally, the root `ResultSet` is returned to the client.
 
 ## Server
 
-The raDB [`Server`](../src/server.rs) manages 
-network traffic for the Raft and SQL engines, using the [Tokio](https://tokio.rs) async executor. 
-It opens TCP listeners on port `9605` for SQL clients and  `9705` for Raft peers, both using 
+The raDB [`Server`](https://github.com/radhesh1/radb/blob/master/src/server.rs) manages
+network traffic for the Raft and SQL engines, using the [Tokio](https://tokio.rs) async executor.
+It opens TCP listeners on port `9605` for SQL clients and  `9705` for Raft peers, both using
 length-prefixed [Bincode](https://github.com/servo/bincode)-encoded message passing via
 [Serde](https://serde.rs)-encoded Tokio streams as a protocol.
 
-The Raft server is split out to [`raft::Server`](../src/raft/server.rs),
-which runs a main [event loop](https://en.wikipedia.org/wiki/Event_loop) routing Raft messages 
-between the local Raft node, state machine driver, TCP peers, and local state machine clients (i.e. 
-the Raft SQL engine wrapper), as well as ticking the Raft logical clock at regular intervals. It 
-spawns separate Tokio tasks that maintain outbound TCP connections to all Raft peers, while 
-internal communication happens via `mpsc` channels.
+The Raft server is split out to [`raft::Server`](https://github.com/radhesh1/radb/blob/master/src/raft/server.rs),
+which runs a main [event loop](https://en.wikipedia.org/wiki/Event_loop) routing Raft messages
+between the local Raft node, TCP peers, and local state machine clients (i.e. the Raft SQL engine
+wrapper), as well as ticking the Raft logical clock at regular intervals. It spawns separate Tokio
+tasks that maintain outbound TCP connections to all Raft peers, while internal communication
+happens via `mpsc`channels.
 
 The SQL server spawns a new Tokio task for each SQL client that connects, running a separate
 SQL session from the SQL storage engine on top of Raft. It communicates with the client by passing
 `server::Request` and `server::Response` messages that are translated to `sql::Session` calls.
 
-The main [`raDB`](../src/bin/radb.rs) binary
-simply initializes a raDB server based on command-line arguments and configuration files, and then 
+The main [`radb`](https://github.com/radhesh1/radb/blob/master/src/bin/radb.rs) binary
+simply initializes a raDB server based on command-line arguments and configuration files, and then
 runs it via the Tokio runtime.
 
 #### Server Tradeoffs
@@ -739,16 +661,10 @@ out of scope for the project.
 
 ## Client
 
-The raDB [`Client`](../src/client.rs) provides a 
-simple API for interacting with a server, mainly by executing SQL statements via `execute()` 
-returning `sql::ResultSet`. It also has the convenience method `with_txn()`, taking a closure 
-that executes a series of SQL statements while automatically catching and retrying serialization
-errors.
+The raDB [`Client`](https://github.com/radhesh1/radb/blob/master/src/client.rs) provides a
+simple API for interacting with a server, mainly by executing SQL statements via `execute()`
+returning `sql::ResultSet`.
 
-There is also `client::Pool`, which manages a set of pre-connected clients that can be retrieved
-for running short-lived queries in a multi-threaded application without incurring connection
-setup costs.
-
-The [`rasql`](../src/bin/rasql.rs) command-line
-client is a simple REPL client that connects to a server using the raDB `Client` and continually 
+The [`rasql`](https://github.com/radhesh1/radb/blob/master/src/bin/rasql.rs) command-line
+client is a simple REPL client that connects to a server using the raDB `Client` and continually
 prompts the user for a SQL query to execute, displaying the returned result.

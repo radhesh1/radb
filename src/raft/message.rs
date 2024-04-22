@@ -1,79 +1,63 @@
-use super::{Entry, Index, NodeID, Status, Term};
+use super::{Entry, Index, NodeID, Term};
 use crate::error::Result;
+use crate::storage;
 
 use serde_derive::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-/// A message address.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub enum Address {
-    /// Broadcast to all peers. Only valid as an outbound recipient (to).
-    Broadcast,
-    /// A node with the specified node ID (local or remote). Valid both as
-    /// sender and recipient.
-    Node(NodeID),
-    /// A local client. Can only send ClientRequest messages, and receive
-    /// ClientResponse messages.
-    Client,
-}
-
-impl Address {
-    /// Unwraps the node ID, or panics if address is not of kind Node.
-    pub fn unwrap(&self) -> NodeID {
-        match self {
-            Self::Node(id) => *id,
-            _ => panic!("unwrap called on non-Node address {:?}", self),
-        }
-    }
-}
-
-/// A message passed between Raft nodes.
+/// A message envelope sent between Raft nodes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Message {
-    /// The current term of the sender. Must be set, unless the sender is
-    /// Address::Client, in which case it must be 0.
+pub struct Envelope {
+    /// The sender.
+    pub from: NodeID,
+    /// The recipient.
+    pub to: NodeID,
+    /// The sender's current term.
     pub term: Term,
-    /// The sender address.
-    pub from: Address,
-    /// The recipient address.
-    pub to: Address,
-    /// The message payload.
-    pub event: Event,
+    /// The message.
+    pub message: Message,
 }
 
-/// An event contained within messages.
+/// A message sent between Raft nodes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Event {
+pub enum Message {
     /// Leaders send periodic heartbeats to its followers.
     Heartbeat {
         /// The index of the leader's last committed log entry.
         commit_index: Index,
         /// The term of the leader's last committed log entry.
         commit_term: Term,
-    },
-    /// Followers confirm loyalty to leader after heartbeats.
-    ConfirmLeader {
-        /// The commit_index of the original leader heartbeat, to confirm
-        /// read requests.
-        commit_index: Index,
-        /// If false, the follower does not have the entry at commit_index
-        /// and would like the leader to replicate it.
-        has_committed: bool,
+        /// The latest read sequence number of the leader.
+        read_seq: ReadSequence,
     },
 
-    /// Candidates solicit votes from all peers when campaigning for leadership.
-    SolicitVote {
-        // The index of the candidate's last stored log entry
+    /// Followers confirm leader heartbeats.
+    HeartbeatResponse {
+        /// The index of the follower's last log entry.
         last_index: Index,
-        // The term of the candidate's last stored log entry
+        /// The term of the follower's last log entry.
+        last_term: Term,
+        /// The read sequence number of the heartbeat we're responding to.
+        read_seq: ReadSequence,
+    },
+
+    /// Candidates campaign for leadership by soliciting votes from peers.
+    Campaign {
+        /// The index of the candidate's last stored log entry
+        last_index: Index,
+        /// The term of the candidate's last stored log entry
         last_term: Term,
     },
 
-    /// Followers may grant a single vote to a candidate per term, on a
-    /// first-come basis. Candidates implicitly vote for themselves.
-    GrantVote,
+    /// Followers may vote for a single candidate per term, on a first-come
+    /// first-serve basis. Candidates implicitly vote for themselves.
+    CampaignResponse {
+        /// If true, the sender granted a vote for the candidate.
+        vote: bool,
+    },
 
-    /// Leaders replicate log entries to followers by appending it to their log.
-    AppendEntries {
+    /// Leaders replicate log entries to followers by appending to their logs.
+    Append {
         /// The index of the log entry immediately preceding the submitted commands.
         base_index: Index,
         /// The term of the log entry immediately preceding the submitted commands.
@@ -81,13 +65,16 @@ pub enum Event {
         /// Commands to replicate.
         entries: Vec<Entry>,
     },
-    /// Followers may accept a set of log entries from a leader.
-    AcceptEntries {
-        /// The index of the last log entry.
+
+    /// Followers may accept or reject appending entries from the leader.
+    AppendResponse {
+        /// If true, the follower rejected the leader's entries.
+        reject: bool,
+        /// The index of the follower's last log entry.
         last_index: Index,
+        /// The term of the follower's last log entry.
+        last_term: Term,
     },
-    /// Followers may also reject a set of log entries from a leader.
-    RejectEntries,
 
     /// A client request. This can be submitted to the leader, or to a follower
     /// which will forward it to its leader. If there is no leader, or the
@@ -103,7 +90,7 @@ pub enum Event {
 
     /// A client response.
     ClientResponse {
-        /// The response ID  matches the ID of the ClientRequest.
+        /// The response ID. This matches the ID of the ClientRequest.
         id: RequestID,
         /// The response, or an error.
         response: Result<Response>,
@@ -113,18 +100,50 @@ pub enum Event {
 /// A client request ID.
 pub type RequestID = Vec<u8>;
 
-/// A client request.
+/// A read sequence number, used to confirm leadership for linearizable reads.
+pub type ReadSequence = u64;
+
+/// A client request, typically passed through to the state machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
-    Query(Vec<u8>),
-    Mutate(Vec<u8>),
+    /// A state machine read command. This is not replicated, and only evaluted
+    /// on the leader.
+    Read(Vec<u8>),
+    /// A state machine write command. This is replicated across all nodes, and
+    /// must result in a deterministic response.
+    Write(Vec<u8>),
+    /// Requests Raft cluster status from the leader.
     Status,
 }
 
-/// A client response.
+/// A client response. This will be wrapped in a Result to handle errors.
+///
+/// TODO: consider a separate error kind here, or a wrapped Result, to separate
+/// fallible state machine operations (returned to the caller) from apply errors
+/// (fatal).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
-    Query(Vec<u8>),
-    Mutate(Vec<u8>),
+    /// A state machine read result.
+    Read(Vec<u8>),
+    /// A state machine write result.
+    Write(Vec<u8>),
+    /// The current Raft leader status.
     Status(Status),
+}
+
+/// Raft cluster status.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    /// The current Raft leader, which generated this status.
+    pub leader: NodeID,
+    /// The current Raft term.
+    pub term: Term,
+    /// The last log indexes of all nodes.
+    pub last_index: HashMap<NodeID, Index>,
+    /// The current commit index.
+    pub commit_index: Index,
+    /// The current applied index.
+    pub apply_index: Index,
+    /// The log storage engine status.
+    pub storage: storage::engine::Status,
 }

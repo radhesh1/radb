@@ -1,5 +1,6 @@
+use crate::encoding::{bincode, keycode};
 use crate::error::{Error, Result};
-use crate::storage::{self, bincode, keycode};
+use crate::storage;
 
 use ::log::debug;
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ pub struct Log {
     /// The underlying storage engine. Uses a trait object instead of generics,
     /// to allow runtime selection of the engine (based on the program config)
     /// and avoid propagating the generic type parameters throughout.
-    engine: Box<dyn storage::engine::Engine>,
+    engine: Box<dyn storage::Engine>,
     /// The index of the last stored entry.
     last_index: Index,
     /// The term of the last stored entry.
@@ -74,7 +75,7 @@ pub struct Log {
 
 impl Log {
     /// Creates a new log, using the given storage engine.
-    pub fn new(mut engine: impl storage::engine::Engine + 'static, sync: bool) -> Result<Self> {
+    pub fn new(mut engine: impl storage::Engine + 'static, sync: bool) -> Result<Self> {
         let (last_index, last_term) = engine
             .scan_prefix(&KeyPrefix::Entry.encode()?)
             .last()
@@ -236,9 +237,6 @@ impl Log {
         if entries[0].index == 0 || entries[0].index > self.last_index + 1 {
             return Err(Error::Internal("Spliced entries must begin before last index".into()));
         }
-        if entries[0].index <= self.commit_index {
-            return Err(Error::Internal("Spliced entries must begin after commit index".into()));
-        }
         if !entries.windows(2).all(|w| w[0].index + 1 == w[1].index) {
             return Err(Error::Internal("Spliced entries must be contiguous".into()));
         }
@@ -254,6 +252,10 @@ impl Log {
             entries = &entries[1..];
         }
         drop(scan);
+
+        if !entries.is_empty() && entries[0].index <= self.commit_index {
+            return Err(Error::Internal("Spliced entries must begin after commit index".into()));
+        }
 
         // Write any entries not already in the log.
         for e in entries {
@@ -275,7 +277,7 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::engine::Memory;
+    use crate::storage::Memory;
     use pretty_assertions::assert_eq;
 
     fn setup() -> Log {

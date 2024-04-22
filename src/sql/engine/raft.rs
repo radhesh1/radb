@@ -1,21 +1,22 @@
 use super::super::schema::{Catalog, Table, Tables};
 use super::super::types::{Expression, Row, Value};
 use super::{Engine as _, IndexScan, Scan, Transaction as _};
+use crate::encoding::bincode;
 use crate::error::{Error, Result};
 use crate::raft::{self, Entry};
-use crate::storage::{self, bincode, mvcc::TransactionState};
+use crate::storage::{self, mvcc::TransactionState};
 
+use crossbeam::channel::Sender;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashSet;
-use tokio::sync::{mpsc, oneshot};
 
 /// A Raft state machine mutation.
 ///
 /// TODO: use Cows for these.
 #[derive(Clone, Serialize, Deserialize)]
 enum Mutation {
-    /// Begins a transaction
-    Begin { read_only: bool, as_of: Option<u64> },
+    /// Begins a read-write transaction
+    Begin,
     /// Commits the given transaction
     Commit(TransactionState),
     /// Rolls back the given transaction
@@ -39,6 +40,8 @@ enum Mutation {
 /// TODO: use Cows for these.
 #[derive(Clone, Serialize, Deserialize)]
 enum Query {
+    /// Begins a read-only transaction
+    BeginReadOnly { as_of: Option<u64> },
     /// Fetches engine status
     Status,
 
@@ -67,29 +70,27 @@ pub struct Status {
 /// A client for the local Raft node.
 #[derive(Clone)]
 struct Client {
-    tx: mpsc::UnboundedSender<(raft::Request, oneshot::Sender<Result<raft::Response>>)>,
+    tx: Sender<(raft::Request, Sender<Result<raft::Response>>)>,
 }
 
 impl Client {
     /// Creates a new Raft client.
-    fn new(
-        tx: mpsc::UnboundedSender<(raft::Request, oneshot::Sender<Result<raft::Response>>)>,
-    ) -> Self {
+    fn new(tx: Sender<(raft::Request, Sender<Result<raft::Response>>)>) -> Self {
         Self { tx }
     }
 
     /// Executes a request against the Raft cluster.
     fn execute(&self, request: raft::Request) -> Result<raft::Response> {
-        let (response_tx, response_rx) = oneshot::channel();
+        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
         self.tx.send((request, response_tx))?;
-        futures::executor::block_on(response_rx)?
+        response_rx.recv()?
     }
 
     /// Mutates the Raft state machine, deserializing the response into the
     /// return type.
     fn mutate<V: DeserializeOwned>(&self, mutation: Mutation) -> Result<V> {
-        match self.execute(raft::Request::Mutate(bincode::serialize(&mutation)?))? {
-            raft::Response::Mutate(response) => Ok(bincode::deserialize(&response)?),
+        match self.execute(raft::Request::Write(bincode::serialize(&mutation)?))? {
+            raft::Response::Write(response) => Ok(bincode::deserialize(&response)?),
             resp => Err(Error::Internal(format!("Unexpected Raft mutation response {:?}", resp))),
         }
     }
@@ -97,8 +98,8 @@ impl Client {
     /// Queries the Raft state machine, deserializing the response into the
     /// return type.
     fn query<V: DeserializeOwned>(&self, query: Query) -> Result<V> {
-        match self.execute(raft::Request::Query(bincode::serialize(&query)?))? {
-            raft::Response::Query(response) => Ok(bincode::deserialize(&response)?),
+        match self.execute(raft::Request::Read(bincode::serialize(&query)?))? {
+            raft::Response::Read(response) => Ok(bincode::deserialize(&response)?),
             resp => Err(Error::Internal(format!("Unexpected Raft query response {:?}", resp))),
         }
     }
@@ -120,14 +121,12 @@ pub struct Raft {
 
 impl Raft {
     /// Creates a new Raft-based SQL engine.
-    pub fn new(
-        tx: mpsc::UnboundedSender<(raft::Request, oneshot::Sender<Result<raft::Response>>)>,
-    ) -> Self {
+    pub fn new(tx: Sender<(raft::Request, Sender<Result<raft::Response>>)>) -> Self {
         Self { client: Client::new(tx) }
     }
 
     /// Creates an underlying state machine for a Raft engine.
-    pub fn new_state<E: storage::engine::Engine>(engine: E) -> Result<State<E>> {
+    pub fn new_state<E: storage::Engine>(engine: E) -> Result<State<E>> {
         State::new(engine)
     }
 
@@ -163,7 +162,11 @@ pub struct Transaction {
 impl Transaction {
     /// Starts a transaction in the given mode.
     fn begin(client: Client, read_only: bool, as_of: Option<u64>) -> Result<Self> {
-        let state = client.mutate(Mutation::Begin { read_only, as_of })?;
+        let state = if read_only || as_of.is_some() {
+            client.query(Query::BeginReadOnly { as_of })?
+        } else {
+            client.mutate(Mutation::Begin)?
+        };
         Ok(Self { client, state })
     }
 }
@@ -178,11 +181,17 @@ impl super::Transaction for Transaction {
     }
 
     fn commit(self) -> Result<()> {
-        self.client.mutate(Mutation::Commit(self.state.clone()))
+        if !self.read_only() {
+            self.client.mutate(Mutation::Commit(self.state.clone()))?
+        }
+        Ok(())
     }
 
     fn rollback(self) -> Result<()> {
-        self.client.mutate(Mutation::Rollback(self.state.clone()))
+        if !self.read_only() {
+            self.client.mutate(Mutation::Rollback(self.state.clone()))?;
+        }
+        Ok(())
     }
 
     fn create(&mut self, table: &str, row: Row) -> Result<()> {
@@ -276,14 +285,14 @@ impl Catalog for Transaction {
 }
 
 /// The Raft state machine for the Raft-based SQL engine, using a KV SQL engine
-pub struct State<E: storage::engine::Engine> {
+pub struct State<E: storage::Engine> {
     /// The underlying KV SQL engine
     engine: super::KV<E>,
     /// The last applied index
     applied_index: u64,
 }
 
-impl<E: storage::engine::Engine> State<E> {
+impl<E: storage::Engine> State<E> {
     /// Creates a new Raft state maching using the given storage engine.
     pub fn new(engine: E) -> Result<Self> {
         let engine = super::KV::new(engine);
@@ -297,16 +306,7 @@ impl<E: storage::engine::Engine> State<E> {
     /// Mutates the state machine.
     fn mutate(&mut self, mutation: Mutation) -> Result<Vec<u8>> {
         match mutation {
-            Mutation::Begin { read_only, as_of } => {
-                let txn = if !read_only {
-                    self.engine.begin()?
-                } else if let Some(version) = as_of {
-                    self.engine.begin_as_of(version)?
-                } else {
-                    self.engine.begin_read_only()?
-                };
-                bincode::serialize(&txn.state())
-            }
+            Mutation::Begin => bincode::serialize(&self.engine.begin()?.state()),
             Mutation::Commit(txn) => bincode::serialize(&self.engine.resume(txn)?.commit()?),
             Mutation::Rollback(txn) => bincode::serialize(&self.engine.resume(txn)?.rollback()?),
 
@@ -330,7 +330,7 @@ impl<E: storage::engine::Engine> State<E> {
     }
 }
 
-impl<E: storage::engine::Engine> raft::State for State<E> {
+impl<E: storage::Engine> raft::State for State<E> {
     fn get_applied_index(&self) -> u64 {
         self.applied_index
     }
@@ -350,8 +350,16 @@ impl<E: storage::engine::Engine> raft::State for State<E> {
         result
     }
 
-    fn query(&self, command: Vec<u8>) -> Result<Vec<u8>> {
+    fn read(&self, command: Vec<u8>) -> Result<Vec<u8>> {
         match bincode::deserialize(&command)? {
+            Query::BeginReadOnly { as_of } => {
+                let txn = if let Some(version) = as_of {
+                    self.engine.begin_as_of(version)?
+                } else {
+                    self.engine.begin_read_only()?
+                };
+                bincode::serialize(&txn.state())
+            }
             Query::Read { txn, table, id } => {
                 bincode::serialize(&self.engine.resume(txn)?.read(&table, &id)?)
             }

@@ -5,7 +5,6 @@ pub use lexer::{Keyword, Lexer, Token};
 use super::types::DataType;
 use crate::error::{Error, Result};
 
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::BTreeMap;
 
@@ -153,7 +152,13 @@ impl<'a> Parser<'a> {
     /// Parses a DROP TABLE DDL statement. The DROP TABLE prefix has
     /// already been consumed.
     fn parse_ddl_drop_table(&mut self) -> Result<ast::Statement> {
-        Ok(ast::Statement::DropTable(self.next_ident()?))
+        let mut if_exists = false;
+        if let Some(Token::Keyword(Keyword::If)) = self.next_if_keyword() {
+            self.next_expect(Some(Token::Keyword(Keyword::Exists)))?;
+            if_exists = true;
+        }
+        let name = self.next_ident()?;
+        Ok(ast::Statement::DropTable { name, if_exists })
     }
 
     /// Parses a column specification
@@ -569,8 +574,8 @@ impl<'a> Parser<'a> {
             }
             Token::String(s) => ast::Literal::String(s).into(),
             Token::Keyword(Keyword::False) => ast::Literal::Boolean(false).into(),
-            Token::Keyword(Keyword::Infinity) => ast::Literal::Float(std::f64::INFINITY).into(),
-            Token::Keyword(Keyword::NaN) => ast::Literal::Float(std::f64::NAN).into(),
+            Token::Keyword(Keyword::Infinity) => ast::Literal::Float(f64::INFINITY).into(),
+            Token::Keyword(Keyword::NaN) => ast::Literal::Float(f64::NAN).into(),
             Token::Keyword(Keyword::Null) => ast::Literal::Null.into(),
             Token::Keyword(Keyword::True) => ast::Literal::Boolean(true).into(),
             t => return Err(Error::Parse(format!("Expected expression atom, found {}", t))),
@@ -782,11 +787,10 @@ impl Operator for PostfixOperator {
 
 // Formats an identifier by quoting it as appropriate
 pub(super) fn format_ident(ident: &str) -> String {
-    lazy_static! {
-        static ref RE_IDENT: Regex = Regex::new(r#"^\w[\w_]*$"#).unwrap();
-    }
+    static RE_IDENT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re_ident = RE_IDENT.get_or_init(|| Regex::new(r#"^\w[\w_]*$"#).unwrap());
 
-    if RE_IDENT.is_match(ident) && Keyword::from_str(ident).is_none() {
+    if re_ident.is_match(ident) && Keyword::from_str(ident).is_none() {
         ident.to_string()
     } else {
         format!("\"{}\"", ident.replace('\"', "\"\""))

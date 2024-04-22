@@ -19,7 +19,7 @@ Numeric types are not interchangable; a float value (even without a fractional p
 
 Keywords are reserved words with special meaning in SQL statements. They are case-insensitive, and must be quoted with `"` to be used as identifiers. The complete list is:
 
-`AS`, `ASC`, `AND`, `BEGIN`, `BOOL`, `BOOLEAN`, `BY`, `CHAR`, `COMMIT`, `CREATE`, `CROSS`, `DEFAULT`,`DELETE`, `DESC`, `DOUBLE`, `DROP`, `EXPLAIN`, `FALSE`, `FLOAT`, `FROM`, `GROUP`, `HAVING`, `INDEX`, `INFINITY`, `INNER`, `INSERT`, `INT`, `INTEGER`, `INTO`, `IS`, `JOIN`, `KEY`, `LEFT`, `LIKE`, `LIMIT`, `NAN`, `NOT`, `NULL`, `OF`, `OFFSET`, `ON`, `ONLY`, `OR`, `ORDER`, `OUTER`, `PRIMARY`, `READ`, `REFERENCES`, `RIGHT`, `ROLLBACK`, `SELECT`, `SET`, `STRING`, `SYSTEM`, `TABLE`, `TEXT`, `TIME`, `TRANSACTION`, `TRUE`, `UNIQUE`, `UPDATE`, `VALUES`, `VARCHAR`, `WHERE`, `WRITE`
+`AS`, `ASC`, `AND`, `BEGIN`, `BOOL`, `BOOLEAN`, `BY`, `CHAR`, `COMMIT`, `CREATE`, `CROSS`, `DEFAULT`,`DELETE`, `DESC`, `DOUBLE`, `DROP`, `EXISTS`, `EXPLAIN`, `FALSE`, `FLOAT`, `FROM`, `GROUP`, `HAVING`, `IF`, `INDEX`, `INFINITY`, `INNER`, `INSERT`, `INT`, `INTEGER`, `INTO`, `IS`, `JOIN`, `KEY`, `LEFT`, `LIKE`, `LIMIT`, `NAN`, `NOT`, `NULL`, `OF`, `OFFSET`, `ON`, `ONLY`, `OR`, `ORDER`, `OUTER`, `PRIMARY`, `READ`, `REFERENCES`, `RIGHT`, `ROLLBACK`, `SELECT`, `SET`, `STRING`, `SYSTEM`, `TABLE`, `TEXT`, `TIME`, `TRANSACTION`, `TRUE`, `UNIQUE`, `UPDATE`, `VALUES`, `VARCHAR`, `WHERE`, `WRITE`
 
 ### Identifiers
 
@@ -254,13 +254,14 @@ WHERE release_year < 2000 AND bluray = FALSE
 
 ### `DROP TABLE`
 
-Deletes a table and all contained data.
+Deletes a table and all contained data. Errors if the table does not
+exist, unless `IF EXISTS` is given.
 
 <pre>
-DROP TABLE <b><i>table_name</i></b>
+DROP TABLE [ IF EXISTS ] <b><i>table_name</i></b>
 </pre>
 
-* ***`table_name`***: the table to delete. Errors if it does not exist.
+* ***`table_name`***: the table to delete.
 
 ### `EXPLAIN`
 
@@ -406,7 +407,7 @@ WHERE release_year >= 2000 AND bluray = FALSE
 
 ## Transactions
 
-raDB supports ACID transactions using MVCC-based snapshot isolation, protecting from the following anomalies: dirty writes, dirty reads, lost updates, fuzzy reads, read skew, and phantom reads. However, write skew anomalies are possible since serializable snapshot isolation is not implemented.
+radbDB supports ACID transactions using MVCC-based snapshot isolation, protecting from the following anomalies: dirty writes, dirty reads, lost updates, fuzzy reads, read skew, and phantom reads. However, write skew anomalies are possible since serializable snapshot isolation is not implemented.
 
 A new transaction is started with `BEGIN`, and ended with either `COMMIT` (atomically writing all changes) or `ROLLBACK` (discarding all changes). If any conflicts occur between concurrent transactions, the lowest transaction ID wins and the others will fail with a serialization error and must retry.
 

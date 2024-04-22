@@ -66,7 +66,9 @@ impl<'a, C: Catalog> Planner<'a, C> {
                 )?,
             },
 
-            ast::Statement::DropTable(table) => Node::DropTable { table },
+            ast::Statement::DropTable { name, if_exists } => {
+                Node::DropTable { table: name, if_exists }
+            }
 
             // DML statements (mutations).
             ast::Statement::Delete { table, r#where } => {
@@ -255,7 +257,7 @@ impl<'a, C: Catalog> Planner<'a, C> {
     }
 
     /// Builds a FROM clause consisting of several items. Each item is either a single table or a
-    /// join of an arbitrary number of tables. All the items are joined, since e.g. 'SELECT * FROM
+    /// join of an arbitrary number of tables. All of the items are joined, since e.g. 'SELECT * FROM
     /// a, b' is an implicit join of a and b.
     fn build_from_clause(&self, scope: &mut Scope, from: Vec<ast::FromItem>) -> Result<Node> {
         let base_scope = scope.clone();
@@ -793,7 +795,7 @@ impl Scope {
             return Err(Error::Internal("Can't modify constant scope".into()));
         }
         let mut new = Self::new();
-        new.tables = self.tables.clone();
+        new.tables.clone_from(&self.tables);
         for (expr, label) in projection {
             match (expr, label) {
                 (_, Some(label)) => new.add_column(None, Some(label.clone())),

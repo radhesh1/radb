@@ -1,16 +1,22 @@
 /*
- * it is the Ra-db server. It takes config via a config file, cli params,and env variables, then starts a tcp server that talks with SQL clients('605) and its raft peers ('705)
+ * radb is the raDB server. It takes configuration via a configuration file, command-line
+ * parameters, and environment variables, then starts up a raDB TCP server that communicates with
+ * SQL clients (port 9605) and Raft peers (port 9705).
  */
 
 #![warn(clippy::all)]
 
 use radb::error::{Error, Result};
-use radb::{raft, sql, storage, Server};
+use radb::raft;
+use radb::sql;
+use radb::storage;
+use radb::Server;
 use serde_derive::Deserialize;
 use std::collections::HashMap;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const COMPACT_MIN_BYTES: u64 = 1024 * 1024;
+
+fn main() -> Result<()> {
     let args = clap::command!()
         .arg(
             clap::Arg::new("config")
@@ -32,30 +38,33 @@ async fn main() -> Result<()> {
     let path = std::path::Path::new(&cfg.data_dir);
     let raft_log = match cfg.storage_raft.as_str() {
         "bitcask" | "" => raft::Log::new(
-            storage::engine::BitCask::new_compact(path.join("log"), cfg.compact_threshold)?,
+            storage::BitCask::new_compact(
+                path.join("log"),
+                cfg.compact_threshold,
+                COMPACT_MIN_BYTES,
+            )?,
             cfg.sync,
         )?,
-        "memory" => raft::Log::new(storage::engine::Memory::new(), false)?,
+        "memory" => raft::Log::new(storage::Memory::new(), false)?,
         name => return Err(Error::Config(format!("Unknown Raft storage engine {}", name))),
     };
     let raft_state: Box<dyn raft::State> = match cfg.storage_sql.as_str() {
         "bitcask" | "" => {
-            let engine =
-                storage::engine::BitCask::new_compact(path.join("state"), cfg.compact_threshold)?;
+            let engine = storage::BitCask::new_compact(
+                path.join("state"),
+                cfg.compact_threshold,
+                COMPACT_MIN_BYTES,
+            )?;
             Box::new(sql::engine::Raft::new_state(engine)?)
         }
         "memory" => {
-            let engine = storage::engine::Memory::new();
+            let engine = storage::Memory::new();
             Box::new(sql::engine::Raft::new_state(engine)?)
         }
         name => return Err(Error::Config(format!("Unknown SQL storage engine {}", name))),
     };
-    Server::new(cfg.id, cfg.peers, raft_log, raft_state)
-        .await?
-        .listen(&cfg.listen_sql, &cfg.listen_raft)
-        .await?
-        .serve()
-        .await
+
+    Server::new(cfg.id, cfg.peers, raft_log, raft_state)?.serve(&cfg.listen_raft, &cfg.listen_sql)
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +84,7 @@ struct Config {
 impl Config {
     fn new(file: &str) -> Result<Self> {
         Ok(config::Config::builder()
-            .set_default("id", "radb")?
+            .set_default("id", "1")?
             .set_default("listen_sql", "0.0.0.0:9605")?
             .set_default("listen_raft", "0.0.0.0:9705")?
             .set_default("log_level", "info")?

@@ -1,15 +1,15 @@
-//! toydump is a debug tool that prints a radb BitCask database in
+//! radump is a debug tool that prints a raDB BitCask database in
 //! human-readable form. It only prints live BitCask data, not garbage entries.
 #![warn(clippy::all)]
 
 use radb::error::{Error, Result};
 use radb::storage::debug;
-use radb::storage::engine::{BitCask, Engine};
+use radb::storage::{BitCask, Engine};
 
 fn main() -> Result<()> {
     let args = clap::command!()
         .about("Prints raDB BitCask contents in human-readable form.")
-        .args([clap::Arg::new("file")])
+        .args([clap::Arg::new("file").required(true)])
         .get_matches();
     let file: &String = args.get_one("file").unwrap();
 

@@ -2,17 +2,16 @@ mod candidate;
 mod follower;
 mod leader;
 
-use super::{Address, Driver, Event, Index, Instruction, Log, Message, State};
-use crate::error::Result;
+use super::{Envelope, Index, Log, Message, State, ELECTION_TIMEOUT_RANGE};
+use crate::error::{Error, Result};
 use candidate::Candidate;
 use follower::Follower;
 use leader::Leader;
 
-use ::log::debug;
+use itertools::Itertools as _;
+use log::debug;
 use rand::Rng as _;
-use serde_derive::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
+use std::collections::HashSet;
 
 /// A node ID.
 pub type NodeID = u8;
@@ -23,29 +22,9 @@ pub type Term = u64;
 /// A logical clock interval as number of ticks.
 pub type Ticks = u8;
 
-/// The interval between leader heartbeats, in ticks.
-const HEARTBEAT_INTERVAL: Ticks = 3;
-
-/// The randomized election timeout range (min-max), in ticks. This is
-/// randomized per node to avoid ties.
-const ELECTION_TIMEOUT_RANGE: std::ops::Range<u8> = 10..20;
-
 /// Generates a randomized election timeout.
 fn rand_election_timeout() -> Ticks {
     rand::thread_rng().gen_range(ELECTION_TIMEOUT_RANGE)
-}
-
-/// Node status
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Status {
-    pub server: NodeID,
-    pub leader: NodeID,
-    pub term: Term,
-    pub node_last_index: HashMap<NodeID, Index>,
-    pub commit_index: Index,
-    pub apply_index: Index,
-    pub storage: String,
-    pub storage_size: u64,
 }
 
 /// A Raft node, with a dynamic role. The node is driven synchronously by
@@ -65,19 +44,14 @@ pub enum Node {
 impl Node {
     /// Creates a new Raft node, starting as a leaderless follower, or leader if
     /// there are no peers.
-    pub async fn new(
+    pub fn new(
         id: NodeID,
         peers: HashSet<NodeID>,
-        mut log: Log,
-        mut state: Box<dyn State>,
-        node_tx: mpsc::UnboundedSender<Message>,
+        log: Log,
+        state: Box<dyn State>,
+        node_tx: crossbeam::channel::Sender<Envelope>,
     ) -> Result<Self> {
-        let (state_tx, state_rx) = mpsc::unbounded_channel();
-        let mut driver = Driver::new(id, state_rx, node_tx.clone());
-        driver.apply_log(&mut *state, &mut log)?;
-        tokio::spawn(driver.drive(state));
-
-        let node = RawNode::new(id, peers, log, node_tx, state_tx)?;
+        let node = RawNode::new(id, peers, log, state, node_tx)?;
         if node.peers.is_empty() {
             // If there are no peers, become leader immediately.
             return Ok(node.into_candidate()?.into_leader()?.into());
@@ -94,8 +68,17 @@ impl Node {
         }
     }
 
-    /// Processes a message.
-    pub fn step(self, msg: Message) -> Result<Self> {
+    /// Returns the node term.
+    pub fn term(&self) -> Term {
+        match self {
+            Node::Candidate(n) => n.term,
+            Node::Follower(n) => n.term,
+            Node::Leader(n) => n.term,
+        }
+    }
+
+    /// Processes a message from a peer.
+    pub fn step(self, msg: Envelope) -> Result<Self> {
         debug!("Stepping {:?}", msg);
         match self {
             Node::Candidate(n) => n.step(msg),
@@ -144,8 +127,8 @@ pub struct RawNode<R: Role = Follower> {
     peers: HashSet<NodeID>,
     term: Term,
     log: Log,
-    node_tx: mpsc::UnboundedSender<Message>,
-    state_tx: mpsc::UnboundedSender<Instruction>,
+    state: Box<dyn State>,
+    node_tx: crossbeam::channel::Sender<Envelope>,
     role: R,
 }
 
@@ -157,10 +140,41 @@ impl<R: Role> RawNode<R> {
             peers: self.peers,
             term: self.term,
             log: self.log,
+            state: self.state,
             node_tx: self.node_tx,
-            state_tx: self.state_tx,
             role,
         }
+    }
+
+    /// Applies any pending, committed entries to the state machine. The command
+    /// responses are discarded, use maybe_apply_with() instead to access them.
+    fn maybe_apply(&mut self) -> Result<()> {
+        Self::maybe_apply_with(&mut self.log, &mut self.state, |_, _| Ok(()))
+    }
+
+    /// Like maybe_apply(), but calls the given closure with the result of every
+    /// applied command. Not a method, so that the closure can mutate the node.
+    fn maybe_apply_with<F>(log: &mut Log, state: &mut Box<dyn State>, mut on_apply: F) -> Result<()>
+    where
+        F: FnMut(Index, Result<Vec<u8>>) -> Result<()>,
+    {
+        let applied_index = state.get_applied_index();
+        let commit_index = log.get_commit_index().0;
+        assert!(commit_index >= applied_index, "Commit index below applied index");
+        if applied_index >= commit_index {
+            return Ok(());
+        }
+
+        let mut scan = log.scan((applied_index + 1)..=commit_index)?;
+        while let Some(entry) = scan.next().transpose()? {
+            let index = entry.index;
+            debug!("Applying {:?}", entry);
+            match state.apply(entry) {
+                Err(error @ Error::Internal(_)) => return Err(error),
+                result => on_apply(index, result)?,
+            }
+        }
+        Ok(())
     }
 
     /// Returns the size of the cluster.
@@ -180,11 +194,20 @@ impl<R: Role> RawNode<R> {
         quorum_value(values)
     }
 
-    /// Sends an event
-    fn send(&self, to: Address, event: Event) -> Result<()> {
-        let msg = Message { term: self.term, from: Address::Node(self.id), to, event };
-        debug!("Sending {:?}", msg);
+    /// Sends a message.
+    fn send(&self, to: NodeID, message: Message) -> Result<()> {
+        let msg = Envelope { from: self.id, to, term: self.term, message };
+        debug!("Sending {msg:?}");
         Ok(self.node_tx.send(msg)?)
+    }
+
+    /// Broadcasts a message to all peers.
+    fn broadcast(&self, message: Message) -> Result<()> {
+        // Sort for test determinism.
+        for id in self.peers.iter().copied().sorted() {
+            self.send(id, message.clone())?;
+        }
+        Ok(())
     }
 
     /// Asserts common node invariants.
@@ -194,39 +217,16 @@ impl<R: Role> RawNode<R> {
     }
 
     /// Asserts message invariants when stepping.
-    ///
-    /// In a real production database, these should be errors instead, since
-    /// external input from the network can't be trusted to uphold invariants.
-    fn assert_step(&self, msg: &Message) {
-        // Messages must be addressed to the local node, or a broadcast.
-        match msg.to {
-            Address::Broadcast => {}
-            Address::Client => panic!("Message to client"),
-            Address::Node(id) => assert_eq!(id, self.id, "Message to other node"),
-        }
+    fn assert_step(&self, msg: &Envelope) {
+        // Messages must be addressed to the local node.
+        assert_eq!(msg.to, self.id, "Message to other node");
 
-        match msg.from {
-            // The broadcast address can't send anything.
-            Address::Broadcast => panic!("Message from broadcast address"),
-            // Clients can only send ClientRequest without a term.
-            Address::Client => {
-                assert_eq!(msg.term, 0, "Client message with term");
-                assert!(
-                    matches!(msg.event, Event::ClientRequest { .. }),
-                    "Non-request message from client"
-                );
-            }
-            // Nodes must be known, and must include their term.
-            Address::Node(id) => {
-                assert!(id == self.id || self.peers.contains(&id), "Unknown sender {}", id);
-                // TODO: For now, accept ClientResponse without term, since the
-                // state driver does not have access to it.
-                assert!(
-                    msg.term > 0 || matches!(msg.event, Event::ClientResponse { .. }),
-                    "Message without term"
-                );
-            }
-        }
+        // Senders must be known.
+        assert!(
+            msg.from == self.id || self.peers.contains(&msg.from),
+            "Unknown sender {}",
+            msg.from
+        );
     }
 }
 
@@ -247,15 +247,14 @@ fn quorum_value<T: Ord + Copy>(mut values: Vec<T>) -> T {
 mod tests {
     pub use super::super::state::tests::TestState;
     use super::super::{Entry, RequestID};
-    use super::follower::tests::{follower_leader, follower_voted_for};
     use super::*;
     use crate::storage;
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
-    use tokio::sync::mpsc;
 
+    #[track_caller]
     pub fn assert_messages<T: std::fmt::Debug + PartialEq>(
-        rx: &mut mpsc::UnboundedReceiver<T>,
+        rx: &mut crossbeam::channel::Receiver<T>,
         msgs: Vec<T>,
     ) {
         let mut actual = Vec::new();
@@ -282,28 +281,48 @@ mod tests {
             }
         }
 
+        #[track_caller]
+        fn state(&mut self) -> &'_ mut Box<dyn State> {
+            match self.node {
+                Node::Candidate(n) => &mut n.state,
+                Node::Follower(n) => &mut n.state,
+                Node::Leader(n) => &mut n.state,
+            }
+        }
+
+        #[track_caller]
         pub fn committed(mut self, index: Index) -> Self {
             assert_eq!(index, self.log().get_commit_index().0, "Unexpected committed index");
             self
         }
 
+        #[track_caller]
+        pub fn applied(mut self, index: Index) -> Self {
+            assert_eq!(index, self.state().get_applied_index(), "Unexpected applied index");
+            self
+        }
+
+        #[track_caller]
         pub fn last(mut self, index: Index) -> Self {
             assert_eq!(index, self.log().get_last_index().0, "Unexpected last index");
             self
         }
 
+        #[track_caller]
         pub fn entry(mut self, entry: Entry) -> Self {
             assert!(entry.index <= self.log().get_last_index().0, "Index beyond last entry");
             assert_eq!(entry, self.log().get(entry.index).unwrap().unwrap());
             self
         }
 
+        #[track_caller]
         pub fn entries(mut self, entries: Vec<Entry>) -> Self {
             assert_eq!(entries, self.log().scan(0..).unwrap().collect::<Result<Vec<_>>>().unwrap());
             self
         }
 
         #[allow(clippy::wrong_self_convention)]
+        #[track_caller]
         pub fn is_candidate(self) -> Self {
             match self.node {
                 Node::Candidate(_) => self,
@@ -313,6 +332,7 @@ mod tests {
         }
 
         #[allow(clippy::wrong_self_convention)]
+        #[track_caller]
         pub fn is_follower(self) -> Self {
             match self.node {
                 Node::Candidate(_) => panic!("Expected follower, got candidate"),
@@ -322,6 +342,7 @@ mod tests {
         }
 
         #[allow(clippy::wrong_self_convention)]
+        #[track_caller]
         pub fn is_leader(self) -> Self {
             match self.node {
                 Node::Candidate(_) => panic!("Expected leader, got candidate"),
@@ -330,12 +351,13 @@ mod tests {
             }
         }
 
+        #[track_caller]
         pub fn leader(self, leader: Option<NodeID>) -> Self {
             assert_eq!(
                 leader,
                 match self.node {
                     Node::Candidate(_) => None,
-                    Node::Follower(n) => follower_leader(n),
+                    Node::Follower(n) => n.role.leader,
                     Node::Leader(_) => None,
                 },
                 "Unexpected leader",
@@ -343,6 +365,7 @@ mod tests {
             self
         }
 
+        #[track_caller]
         pub fn forwarded(self, forwarded: Vec<RequestID>) -> Self {
             assert_eq!(
                 forwarded.into_iter().collect::<HashSet<RequestID>>(),
@@ -355,6 +378,7 @@ mod tests {
             self
         }
 
+        #[track_caller]
         pub fn term(mut self, term: Term) -> Self {
             assert_eq!(
                 term,
@@ -371,7 +395,7 @@ mod tests {
                 saved_voted_for,
                 match self.node {
                     Node::Candidate(n) => Some(n.id),
-                    Node::Follower(n) => follower_voted_for(n),
+                    Node::Follower(n) => n.role.voted_for,
                     Node::Leader(n) => Some(n.id),
                 },
                 "Incorrect voted_for stored in log"
@@ -379,12 +403,13 @@ mod tests {
             self
         }
 
+        #[track_caller]
         pub fn voted_for(mut self, voted_for: Option<NodeID>) -> Self {
             assert_eq!(
                 voted_for,
                 match self.node {
                     Node::Candidate(_) => None,
-                    Node::Follower(n) => follower_voted_for(n),
+                    Node::Follower(n) => n.role.voted_for,
                     Node::Leader(_) => None,
                 },
                 "Unexpected voted_for"
@@ -399,38 +424,36 @@ mod tests {
         NodeAsserter::new(node)
     }
 
-    fn setup_rolenode() -> Result<(RawNode<Follower>, mpsc::UnboundedReceiver<Message>)> {
+    fn setup_rolenode() -> Result<(RawNode<Follower>, crossbeam::channel::Receiver<Envelope>)> {
         setup_rolenode_peers(vec![2, 3])
     }
 
     fn setup_rolenode_peers(
         peers: Vec<NodeID>,
-    ) -> Result<(RawNode<Follower>, mpsc::UnboundedReceiver<Message>)> {
-        let (node_tx, node_rx) = mpsc::unbounded_channel();
-        let (state_tx, _) = mpsc::unbounded_channel();
+    ) -> Result<(RawNode<Follower>, crossbeam::channel::Receiver<Envelope>)> {
+        let (node_tx, node_rx) = crossbeam::channel::unbounded();
         let node = RawNode {
             role: Follower::new(None, None),
             id: 1,
             peers: HashSet::from_iter(peers),
             term: 1,
-            log: Log::new(storage::engine::Memory::new(), false)?,
+            log: Log::new(storage::Memory::new(), false)?,
+            state: Box::new(TestState::new(0)),
             node_tx,
-            state_tx,
         };
         Ok((node, node_rx))
     }
 
-    #[tokio::test]
-    async fn new() -> Result<()> {
-        let (node_tx, _) = mpsc::unbounded_channel();
+    #[test]
+    fn new() -> Result<()> {
+        let (node_tx, _) = crossbeam::channel::unbounded();
         let node = Node::new(
             1,
             HashSet::from([2, 3]),
-            Log::new(storage::engine::Memory::new(), false)?,
+            Log::new(storage::Memory::new(), false)?,
             Box::new(TestState::new(0)),
             node_tx,
-        )
-        .await?;
+        )?;
         match node {
             Node::Follower(rolenode) => {
                 assert_eq!(rolenode.id, 1);
@@ -442,68 +465,16 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn new_state_apply_all() -> Result<()> {
-        let (node_tx, _) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false)?;
-        log.append(1, Some(vec![0x01]))?;
-        log.append(2, None)?;
-        log.append(2, Some(vec![0x02]))?;
-        log.commit(3)?;
-        log.append(2, Some(vec![0x03]))?;
-        let state = Box::new(TestState::new(0));
-
-        Node::new(1, HashSet::from([2, 3]), log, state.clone(), node_tx).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(state.list(), vec![vec![0x01], vec![0x02]]);
-        assert_eq!(state.get_applied_index(), 3);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn new_state_apply_partial() -> Result<()> {
-        let (node_tx, _) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false)?;
-        log.append(1, Some(vec![0x01]))?;
-        log.append(2, None)?;
-        log.append(2, Some(vec![0x02]))?;
-        log.commit(3)?;
-        log.append(2, Some(vec![0x03]))?;
-        let state = Box::new(TestState::new(2));
-
-        Node::new(1, HashSet::from([2, 3]), log, state.clone(), node_tx).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(state.list(), vec![vec![0x02]]);
-        assert_eq!(state.get_applied_index(), 3);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[should_panic(expected = "applied index above commit index")]
-    async fn new_state_apply_missing() {
-        let (node_tx, _) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false).unwrap();
-        log.append(1, Some(vec![0x01])).unwrap();
-        log.append(2, None).unwrap();
-        log.append(2, Some(vec![0x02])).unwrap();
-        log.commit(3).unwrap();
-        log.append(2, Some(vec![0x03])).unwrap();
-        let state = Box::new(TestState::new(4));
-
-        Node::new(1, HashSet::from([2, 3]), log, state.clone(), node_tx).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn new_single() -> Result<()> {
-        let (node_tx, _node_rx) = mpsc::unbounded_channel();
+    #[test]
+    fn new_single() -> Result<()> {
+        let (node_tx, _node_rx) = crossbeam::channel::unbounded();
         let node = Node::new(
             1,
             HashSet::new(),
-            Log::new(storage::engine::Memory::new(), false)?,
+            Log::new(storage::Memory::new(), false)?,
             Box::new(TestState::new(0)),
             node_tx,
-        )
-        .await?;
+        )?;
         match node {
             Node::Leader(rolenode) => {
                 assert_eq!(rolenode.id, 1);
@@ -530,14 +501,14 @@ mod tests {
     #[test]
     fn send() -> Result<()> {
         let (node, mut rx) = setup_rolenode()?;
-        node.send(Address::Node(2), Event::Heartbeat { commit_index: 1, commit_term: 1 })?;
+        node.send(2, Message::Heartbeat { commit_index: 1, commit_term: 1, read_seq: 7 })?;
         assert_messages(
             &mut rx,
-            vec![Message {
-                from: Address::Node(1),
-                to: Address::Node(2),
+            vec![Envelope {
+                from: 1,
+                to: 2,
                 term: 1,
-                event: Event::Heartbeat { commit_index: 1, commit_term: 1 },
+                message: Message::Heartbeat { commit_index: 1, commit_term: 1, read_seq: 7 },
             }],
         );
         Ok(())

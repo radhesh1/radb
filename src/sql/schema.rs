@@ -16,6 +16,7 @@ pub trait Catalog {
     fn read_table(&self, table: &str) -> Result<Option<Table>>;
     /// Iterates over all tables
     fn scan_tables(&self) -> Result<Tables>;
+
     /// Reads a table, and errors if it does not exist
     fn must_read_table(&self, table: &str) -> Result<Table> {
         self.read_table(table)?

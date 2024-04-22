@@ -14,11 +14,10 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{error::ReadlineError, Editor, Modifiers};
 use rustyline_derive::{Completer, Helper, Highlighter, Hinter};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let opts = clap::command!()
         .name("rasql")
-        .about("A raDB client.")
+        .about("A RaDB client.")
         .args([
             clap::Arg::new("command"),
             clap::Arg::new("host")
@@ -36,12 +35,12 @@ async fn main() -> Result<()> {
         .get_matches();
 
     let mut rasql =
-        RaSQL::new(opts.get_one::<String>("host").unwrap(), *opts.get_one("port").unwrap()).await?;
+        RaSQL::new(opts.get_one::<String>("host").unwrap(), *opts.get_one("port").unwrap())?;
 
     if let Some(command) = opts.get_one::<&str>("command") {
-        rasql.execute(command).await
+        rasql.execute(command)
     } else {
-        rasql.run().await
+        rasql.run()
     }
 }
 
@@ -55,9 +54,9 @@ struct RaSQL {
 
 impl RaSQL {
     /// Creates a new RaSQL REPL for the given server host and port
-    async fn new(host: &str, port: u16) -> Result<Self> {
+    fn new(host: &str, port: u16) -> Result<Self> {
         Ok(Self {
-            client: Client::new((host, port)).await?,
+            client: Client::new((host, port))?,
             editor: Editor::new()?,
             history_path: std::env::var_os("HOME")
                 .map(|home| std::path::Path::new(&home).join(".rasql.history")),
@@ -66,18 +65,18 @@ impl RaSQL {
     }
 
     /// Executes a line of input
-    async fn execute(&mut self, input: &str) -> Result<()> {
+    fn execute(&mut self, input: &str) -> Result<()> {
         if input.starts_with('!') {
-            self.execute_command(input).await
+            self.execute_command(input)
         } else if !input.is_empty() {
-            self.execute_query(input).await
+            self.execute_query(input)
         } else {
             Ok(())
         }
     }
 
     /// Handles a REPL command (prefixed by !, e.g. !help)
-    async fn execute_command(&mut self, input: &str) -> Result<()> {
+    fn execute_command(&mut self, input: &str) -> Result<()> {
         let mut input = input.split_ascii_whitespace();
         let command = input.next().ok_or_else(|| Error::Parse("Expected command.".to_string()))?;
 
@@ -115,10 +114,10 @@ The following commands are also available:
 "#
             ),
             "!status" => {
-                let status = self.client.status().await?;
+                let status = self.client.status()?;
                 let mut node_logs = status
                     .raft
-                    .node_last_index
+                    .last_index
                     .iter()
                     .map(|(id, index)| format!("{}:{}", id, index))
                     .collect::<Vec<_>>();
@@ -131,15 +130,15 @@ Node logs: {logs}
 MVCC:      {active_txns} active txns, {versions} versions
 Storage:   {keys} keys, {logical_size} MB logical, {nodes}x {disk_size} MB disk, {garbage_percent}% garbage ({sql_storage} engine)
 "#,
-                    server = status.raft.server,
+                    server = status.server,
                     leader = status.raft.leader,
                     term = status.raft.term,
-                    nodes = status.raft.node_last_index.len(),
+                    nodes = status.raft.last_index.len(),
                     committed = status.raft.commit_index,
                     applied = status.raft.apply_index,
-                    raft_storage = status.raft.storage,
+                    raft_storage = status.raft.storage.name,
                     raft_size =
-                        format_args!("{:.3}", status.raft.storage_size as f64 / 1000.0 / 1000.0),
+                        format_args!("{:.3}", status.raft.storage.size as f64 / 1000.0 / 1000.0),
                     logs = node_logs.join(" "),
                     versions = status.mvcc.versions,
                     active_txns = status.mvcc.active_txns,
@@ -165,11 +164,11 @@ Storage:   {keys} keys, {logical_size} MB logical, {nodes}x {disk_size} MB disk,
             }
             "!table" => {
                 let args = getargs(1)?;
-                println!("{}", self.client.get_table(args[0]).await?);
+                println!("{}", self.client.get_table(args[0])?);
             }
             "!tables" => {
                 getargs(0)?;
-                for table in self.client.list_tables().await? {
+                for table in self.client.list_tables()? {
                     println!("{}", table)
                 }
             }
@@ -179,8 +178,8 @@ Storage:   {keys} keys, {logical_size} MB logical, {nodes}x {disk_size} MB disk,
     }
 
     /// Runs a query and displays the results
-    async fn execute_query(&mut self, query: &str) -> Result<()> {
-        match self.client.execute(query).await? {
+    fn execute_query(&mut self, query: &str) -> Result<()> {
+        match self.client.execute(query)? {
             ResultSet::Begin { version, read_only } => match read_only {
                 false => println!("Began transaction at new version {}", version),
                 true => println!("Began read-only transaction at version {}", version),
@@ -191,7 +190,10 @@ Storage:   {keys} keys, {logical_size} MB logical, {nodes}x {disk_size} MB disk,
             ResultSet::Delete { count } => println!("Deleted {} rows", count),
             ResultSet::Update { count } => println!("Updated {} rows", count),
             ResultSet::CreateTable { name } => println!("Created table {}", name),
-            ResultSet::DropTable { name } => println!("Dropped table {}", name),
+            ResultSet::DropTable { name, existed } => match existed {
+                true => println!("Dropped table {}", name),
+                false => println!("Table {} did not exit", name),
+            },
             ResultSet::Explain(plan) => println!("{}", plan),
             ResultSet::Query { columns, mut rows } => {
                 if self.show_headers {
@@ -233,7 +235,7 @@ Storage:   {keys} keys, {logical_size} MB logical, {nodes}x {disk_size} MB disk,
     }
 
     /// Runs the RaSQL REPL
-    async fn run(&mut self) -> Result<()> {
+    fn run(&mut self) -> Result<()> {
         if let Some(path) = &self.history_path {
             match self.editor.load_history(path) {
                 Ok(_) => {}
@@ -248,14 +250,11 @@ Storage:   {keys} keys, {logical_size} MB logical, {nodes}x {disk_size} MB disk,
             rustyline::Cmd::Noop,
         );
 
-        let status = self.client.status().await?;
-        println!(
-            "Connected to raDB node \"{}\". Enter !help for instructions.",
-            status.raft.server
-        );
+        let status = self.client.status()?;
+        println!("Connected to raDB node \"{}\". Enter !help for instructions.", status.server);
 
         while let Some(input) = self.prompt()? {
-            match self.execute(&input).await {
+            match self.execute(&input) {
                 Ok(()) => {}
                 error @ Err(Error::Internal(_)) => return error,
                 Err(error) => println!("Error: {}", error),

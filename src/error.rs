@@ -4,7 +4,7 @@ use std::fmt::{self, Display};
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// raDB errors. All except Internal are considered user-facing.
+/// radb errors. All except Internal are considered user-facing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Error {
     Abort,
@@ -52,6 +52,42 @@ impl From<Box<bincode::ErrorKind>> for Error {
 impl From<config::ConfigError> for Error {
     fn from(err: config::ConfigError) -> Self {
         Error::Config(err.to_string())
+    }
+}
+
+impl From<crossbeam::channel::RecvError> for Error {
+    fn from(err: crossbeam::channel::RecvError) -> Self {
+        Error::Internal(err.to_string())
+    }
+}
+
+impl<T> From<crossbeam::channel::SendError<T>> for Error {
+    fn from(err: crossbeam::channel::SendError<T>) -> Self {
+        Error::Internal(err.to_string())
+    }
+}
+
+impl From<crossbeam::channel::TryRecvError> for Error {
+    fn from(err: crossbeam::channel::TryRecvError) -> Self {
+        Error::Internal(err.to_string())
+    }
+}
+
+impl<T> From<crossbeam::channel::TrySendError<T>> for Error {
+    fn from(err: crossbeam::channel::TrySendError<T>) -> Self {
+        Error::Internal(err.to_string())
+    }
+}
+
+impl From<hdrhistogram::CreationError> for Error {
+    fn from(err: hdrhistogram::CreationError) -> Self {
+        Error::Internal(err.to_string())
+    }
+}
+
+impl From<hdrhistogram::RecordError> for Error {
+    fn from(err: hdrhistogram::RecordError) -> Self {
+        Error::Internal(err.to_string())
     }
 }
 
@@ -129,36 +165,6 @@ impl From<std::string::FromUtf8Error> for Error {
 
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(err: std::sync::PoisonError<T>) -> Self {
-        Error::Internal(err.to_string())
-    }
-}
-
-impl From<tokio::task::JoinError> for Error {
-    fn from(err: tokio::task::JoinError) -> Self {
-        Error::Internal(err.to_string())
-    }
-}
-
-impl From<tokio::sync::mpsc::error::TryRecvError> for Error {
-    fn from(err: tokio::sync::mpsc::error::TryRecvError) -> Self {
-        Error::Internal(err.to_string())
-    }
-}
-
-impl<T> From<tokio::sync::mpsc::error::SendError<T>> for Error {
-    fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {
-        Error::Internal(err.to_string())
-    }
-}
-
-impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for Error {
-    fn from(err: tokio::sync::mpsc::error::TrySendError<T>) -> Self {
-        Error::Internal(err.to_string())
-    }
-}
-
-impl From<tokio::sync::oneshot::error::RecvError> for Error {
-    fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
         Error::Internal(err.to_string())
     }
 }

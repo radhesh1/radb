@@ -10,16 +10,16 @@ jobs:
     timeout-minutes: 10
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: dtolnay/rust-toolchain@1.77.0
-      id: toolchain
-      with:
-        components: clippy, rustfmt
-    - uses: actions/cache@v3
-      with:
-        path: target
-        key: ${{runner.os}}-target-${{steps.toolchain.outputs.cachekey}}-${{hashFiles('Cargo.lock')}}
-    - run: cargo build --tests
-    - run: cargo test
-    - run: cargo clippy --tests --no-deps -- -D warnings
-    - run: cargo fmt --check
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@1.77.0
+        id: toolchain
+        with:
+          components: clippy, rustfmt
+      - uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{runner.os}}-target-${{steps.toolchain.outputs.cachekey}}-${{hashFiles('Cargo.lock')}}
+      - run: cargo build --tests
+      - run: cargo test
+      - run: cargo clippy --tests --no-deps -- -D warnings
+      - run: cargo fmt --check

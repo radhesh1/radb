@@ -1,0 +1,67 @@
+version: "3.7"
+
+networks:
+  radb:
+    name: radb
+    ipam:
+      driver: default
+      config:
+      - subnet: 192.168.0.0/24
+
+services:
+  radb-a: &radb
+    build: ../..
+    environment:
+    - RADB_LOG_LEVEL
+    volumes:
+    - ./radb-a/radb.yaml:/etc/radb.yaml
+    - ./radb-a/data:/var/lib/radb
+    networks:
+      radb:
+        ipv4_address: 192.168.0.101
+    ports:
+    - 9601:9605
+
+  radb-b:
+    <<: *radb
+    volumes:
+    - ./radb-b/radb.yaml:/etc/radb.yaml
+    - ./radb-b/data:/var/lib/radb
+    networks:
+      radb:
+        ipv4_address: 192.168.0.102
+    ports:
+    - 9602:9605
+
+  radb-c:
+    <<: *radb
+    volumes:
+    - ./radb-c/radb.yaml:/etc/radb.yaml
+    - ./radb-c/data:/var/lib/radb
+    networks:
+      radb:
+        ipv4_address: 192.168.0.103
+    ports:
+    - 9603:9605
+
+  radb-d:
+    <<: *radb
+    volumes:
+    - ./radb-d/radb.yaml:/etc/radb.yaml
+    - ./radb-d/data:/var/lib/radb
+    networks:
+      radb:
+        ipv4_address: 192.168.0.104
+    ports:
+    - 9604:9605
+
+  radb-e:
+    <<: *radb
+    volumes:
+    - ./radb-e/radb.yaml:/etc/radb.yaml
+    - ./radb-e/data:/var/lib/radb
+    networks:
+      radb:
+        ipv4_address: 192.168.0.105
+    ports:
+    - 9605:9605

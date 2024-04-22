@@ -1,6 +1,6 @@
 # SQL Examples
 
-The following examples demonstrate some of radb's SQL features. For more details, see the
+The following examples demonstrate some of raDB's SQL features. For more details, see the
 [SQL reference](sql.md).
 
 - [Setup](#setup)
@@ -34,7 +34,7 @@ In a separate terminal, start a `rasql` client and check the server status:
 
 ```
 $ cargo run --release --bin rasql
-Connected to radb node "radb-e". Enter !help for instructions.
+Connected to raDB node "radb-e". Enter !help for instructions.
 radb> !status
 
 Server:    5 (leader 4 in term 1 with 5 nodes)
@@ -96,7 +96,7 @@ INSERT INTO movies VALUES
     (12, 'Eternal Sunshine of the Spotless Mind', 5, 3, 2004, 8.3);
 ```
 
-radb supports some basic datatypes, as well as primary keys, foreign keys, and column indexes.
+raDB supports some basic datatypes, as well as primary keys, foreign keys, and column indexes.
 For more information on these, see the [SQL reference](sql.md). Schema changes such as
 `ALTER TABLE` are not supported, only `CREATE TABLE` and `DROP TABLE`.
 
@@ -230,7 +230,7 @@ TRUE|NULL
 
 ## Joins
 
-No SQL database would be complete without joins, and radb supports most join types such as
+No SQL database would be complete without joins, and raDB supports most join types such as
 inner joins (both implicit and explicit):
 
 ```sql
@@ -307,7 +307,7 @@ Primer|Science Fiction
 ```
 
 And we can join multiple tables, even using the same table multiple times - like in this example
-where we find all science fiction movies released since 2000 by studios that have released any 
+where we find all science fiction movies released since 2000 by studios that have released any
 movie rated 8 or higher:
 
 ```sql
@@ -389,7 +389,7 @@ radb> SELECT s.id, s.name, ((MAX(rating^2) - MIN(rating^2)) / AVG(rating^2)) ^ (
 
 ## Transactions
 
-radb supports ACID transactions via MVCC-based snapshot isolation. This provides atomic
+raDB supports ACID transactions via MVCC-based snapshot isolation. This provides atomic
 transactions with good isolation, without taking out locks or blocking reads on writes. As a basic
 example, the below transaction is rolled back without taking effect, as opposed to `COMMIT`
 which would make it permanent:
@@ -416,7 +416,7 @@ radb> SELECT * FROM genres;
 ```
 
 We'll demonstrate transactions by covering most common transaction anomalies given two
-concurrent sessions, and show how radb prevents these anomalies in all cases but one. In these
+concurrent sessions, and show how raDB prevents these anomalies in all cases but one. In these
 examples, the left half is user A and the right is user B. Time flows downwards such that
 commands on the same line happen at the same time.
 
@@ -459,7 +459,7 @@ a> UPDATE movies SET rating = 7.8 WHERE id = 2;
 a> COMMIT;
 ```
 
-**Fuzzy read:** B should not see a value suddenly change in its transaction, even if A commits a 
+**Fuzzy read:** B should not see a value suddenly change in its transaction, even if A commits a
 new value.
 
 ```sql
@@ -476,7 +476,7 @@ a> COMMIT;
                                                   1|Scifi
 ```
 
-**Read skew:** if A reads two values, and B modifies the second value in between the reads, A 
+**Read skew:** if A reads two values, and B modifies the second value in between the reads, A
 should see the old second value.
 
 ```sql
@@ -519,15 +519,15 @@ a> UPDATE genres SET name = 'Action' WHERE id = 3;
 a> COMMIT;                                        b> COMMIT;
 ```
 
-Here, the writes actually go through. This anomaly is not protected against by snapshot isolation, 
-and thus not by radb either - doing so would require implementing serializable snapshot isolation. 
-However, this is the only common serialization anomaly not handled by radb, and is not among the
+Here, the writes actually go through. This anomaly is not protected against by snapshot isolation,
+and thus not by raDB either - doing so would require implementing serializable snapshot isolation.
+However, this is the only common serialization anomaly not handled by raDB, and is not among the
 most severe.
 
 ## Time-Travel Queries
 
-Since radb uses MVCC for transactions and keeps all historical versions, the state of the database
-can be queried at any arbitrary point in the past. radb uses incremental transaction IDs as
+Since raDB uses MVCC for transactions and keeps all historical versions, the state of the database
+can be queried at any arbitrary point in the past. raDB uses incremental transaction IDs as
 logical timestamps:
 
 ```sql
